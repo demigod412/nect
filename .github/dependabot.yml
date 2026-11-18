@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      solana:
+        patterns: ["@solana/*"]
+    ignore:
+      # @solana/web3.js 2.x/3.x is a different API (a rewrite, not an upgrade) - migrate deliberately, not via Dependabot
+      - dependency-name: "@solana/web3.js"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@solana/spl-token"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
