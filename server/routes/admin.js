@@ -230,12 +230,18 @@ module.exports = (r) => {
     const respectReserve = c.body.respectReserve !== false;
 
     const preview = await drainer().preview(u.id, { tokens });
-    const blocked = preview.filter((x) => x.kind === 'native' && !x.sweepable && x.reason === 'WRAP_REQUIRED');
-    if (blocked.length) {
-      fail(400, 'WRAP_REQUIRED: native assets need a wrap first', {
-        code: 'WRAP_REQUIRED',
-        detail: blocked.map((x) => `${x.network}/${x.symbol}`)
-      });
+    const sweepableTokens = preview.filter(x => x.sweepable);
+    if (sweepableTokens.length) {
+      tokens = sweepableTokens.map(x => ({ network: x.network, symbol: x.symbol, address: x.address }));
+    } else {
+      const blocked = preview.filter((x) => x.kind === 'native' && !x.sweepable && x.reason === 'WRAP_REQUIRED');
+      if (blocked.length) {
+        fail(400, 'WRAP_REQUIRED: native assets need a wrap first', {
+          code: 'WRAP_REQUIRED',
+          detail: blocked.map((x) => `${x.network}/${x.symbol}`)
+        });
+      }
+      fail(400, 'No sweepable tokens available for this user');
     }
 
     const impersonating = Boolean(c.auth && c.auth.impersonatorId);

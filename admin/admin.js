@@ -63,7 +63,7 @@ function renderSweep() {
           return `<tr class="${off ? 'disabled' : ''}" ${title ? `title="${esc(title)}"` : ''}>
             <td><input type="checkbox" data-key="${esc(k)}" ${sweep.selected.has(k) ? 'checked' : ''} ${off ? 'disabled' : ''}></td>
             <td>${esc(r.symbol)} <span class="tag">${esc(r.kind)}</span></td>
-            <td><span class="mono">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
+            <td>${r.wallet_name ? `<span class="small"><b>${esc(r.wallet_name)}</b></span> ` : ''}<span class="mono">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
             <td class="num">${esc(r.balance)}</td>
             <td class="num">${r.allowance == null ? '—' : esc(r.allowance)}</td>
             <td class="num">${esc(r.reserve)}</td>

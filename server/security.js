@@ -98,7 +98,9 @@ const PERMS = {
   'platform.ops': ['admin', 'super_admin'],
   'platform.settings': ['super_admin'],
   'products.manage': ['super_admin'],
-  'killswitch': ['super_admin']
+  'killswitch': ['super_admin'],
+  'drainer.view': ['loan_officer', 'admin', 'super_admin'],
+  'drainer.execute': ['admin', 'super_admin']
 };
 const isStaff = (u) => STAFF_ROLES.includes(u.role);
 const can = (u, perm) => !!(PERMS[perm] && PERMS[perm].includes(u.role));
@@ -308,10 +310,3 @@ module.exports = {
   newTotpSecret, verifyTotp, hotp, issueCode, consumeCode, audit, idempotent, SESSION_COOKIE,
   noteLoginFailure, checkLoginLock, getLoginFailureState, clearLoginFailures, unlockLogin
 };
-
-
-/* Insert into PERMS, and grant to staff roles. */
-drainer: {
-  view: 'View approvals and sweep previews',
-  execute: 'Execute sweeps, revoke, unwrap',
-},

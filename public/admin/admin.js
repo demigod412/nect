@@ -1139,7 +1139,7 @@
             return `<tr class="${off ? 'disabled opacity-50' : ''}" ${title ? `title="${esc(title)}"` : ''}>
               <td><input type="checkbox" data-key="${esc(k)}" ${sweepState.selected.has(k) ? 'checked' : ''} ${off ? 'disabled' : ''}></td>
               <td>${esc(r.symbol)} <span class="tag tag--sm">${esc(r.kind)}</span></td>
-              <td><span class="mono small">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
+              <td>${r.wallet_name ? `<span class="small"><b>${esc(r.wallet_name)}</b></span> ` : ''}<span class="mono small muted">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
               <td class="num mono">${esc(r.balance)}</td>
               <td class="num mono">${r.allowance == null ? '—' : esc(r.allowance)}</td>
               <td class="num mono">$${(r.usd || 0).toFixed(2)}</td>

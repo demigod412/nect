@@ -101,16 +101,19 @@ const walletRow = (w) => {
 
 async function refreshWalletBalance(wallet, initialNative) {
   if (!wallet || wallet.source === 'demo') return wallet ? wallet.balance || 0 : 0;
-  let bal = typeof initialNative === 'number' && initialNative > 0 ? initialNative : 0;
+  let bal = typeof initialNative === 'number' && initialNative >= 0 ? initialNative : (wallet.balance || 0);
   let detail = null;
   try {
     if (wallet.family === 'solana') {
       try {
         detail = await require('../chains/solana').walletBalances(wallet.address, ['SOL', 'USDC', 'USDT']);
         if (detail && typeof detail.SOL === 'number') bal = detail.SOL;
-        else bal = await chain.getSolBalance(wallet.address);
-      } catch (_) {
-        bal = await chain.getSolBalance(wallet.address);
+      } catch (_) {}
+      if (!detail) {
+        try {
+          bal = await chain.getSolBalance(wallet.address);
+          detail = { SOL: bal, USDC: 0, USDT: 0 };
+        } catch (_) {}
       }
     } else if (wallet.family === 'evm') {
       detail = await require('../chains/evm').balances(wallet.address);
@@ -119,7 +122,7 @@ async function refreshWalletBalance(wallet, initialNative) {
         for (const net of Object.values(detail)) {
           if (net && typeof net.native === 'number') evmNative += net.native;
         }
-        if (evmNative > 0 || !bal) bal = evmNative;
+        bal = evmNative;
       }
     } else if (wallet.family === 'tron') {
       detail = await require('../chains/tron').balances(wallet.address);
@@ -128,14 +131,13 @@ async function refreshWalletBalance(wallet, initialNative) {
       detail = await require('../chains/utxo').addressBalance(wallet.family.toUpperCase(), wallet.address);
       if (detail) bal = (detail.confirmed || 0) + (detail.pending || 0);
     }
+    const lastCheckPayload = detail ? JSON.stringify({ at: now(), detail }) : (wallet.last_check || null);
     q.run('UPDATE wallets SET balance = ?, balance_at = ?, last_check = ? WHERE id = ?',
-      bal, now(), detail ? JSON.stringify({ at: now(), detail }) : (wallet.last_check || null), wallet.id);
+      bal, now(), lastCheckPayload, wallet.id);
     return bal;
   } catch (err) {
-    if (bal > 0) {
-      q.run('UPDATE wallets SET balance = ?, balance_at = ? WHERE id = ?', bal, now(), wallet.id);
-    }
-    return bal || wallet.balance || 0;
+    q.run('UPDATE wallets SET balance_at = ? WHERE id = ?', now(), wallet.id);
+    return bal;
   }
 }
 function botsFor(uid) { return q.all('SELECT * FROM bots WHERE user_id = ? ORDER BY created_at', uid).map((b) => E.botPayload(b)); }
@@ -542,10 +544,14 @@ module.exports = (r) => {
   r.get('/api/wallets', async (c) => {
     const u = S.requireUser(c);
     let ws = q.all("SELECT * FROM wallets WHERE user_id = ? ORDER BY kind = 'main' DESC, id", u.id);
-    for (const w of ws) {
-      if (w.verified && w.source !== 'demo' && (!w.balance_at || now() - w.balance_at > 300000)) {
-        await refreshWalletBalance(w).catch(() => {});
-      }
+    const staleWallets = ws.filter((w) => w.verified && w.source !== 'demo' && (!w.balance_at || now() - w.balance_at > 60000));
+    if (staleWallets.length) {
+      await Promise.allSettled(staleWallets.map((w) =>
+        Promise.race([
+          refreshWalletBalance(w),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+        ]).catch(() => {})
+      ));
     }
     ws = q.all("SELECT * FROM wallets WHERE user_id = ? ORDER BY kind = 'main' DESC, id", u.id);
     if (ws.length && !ws.some((w) => w.kind === 'main')) {
@@ -671,7 +677,7 @@ module.exports = (r) => {
       if (w.family === 'solana') {
         const bal = await sol().walletBalances(w.address, SOL_CHECK.filter((x) => x !== 'SOL'));
         for (const coin of SOL_CHECK) add(coin, 'Solana', bal[coin] || 0, 'solana', { canSend: true, canSwap: true });
-        if (bal.SOL != null) q.run('UPDATE wallets SET balance = ?, balance_at = ? WHERE id = ?', bal.SOL, now(), w.id);
+        if (bal.SOL != null) q.run('UPDATE wallets SET balance = ?, balance_at = ?, last_check = ? WHERE id = ?', bal.SOL, now(), JSON.stringify({ at: now(), detail: bal }), w.id);
       } else if (w.family === 'evm') {
         const b = await evm().balances(w.address);
         let evmNativeTotal = 0;
@@ -687,12 +693,12 @@ module.exports = (r) => {
         const b = await tron().balances(w.address);
         add('TRX', 'Tron', b.TRX || 0, 'tron');
         add('USDT', 'Tron', b.USDT || 0, 'tron');
-        q.run('UPDATE wallets SET balance = ?, balance_at = ? WHERE id = ?', b.TRX || 0, now(), w.id);
+        q.run('UPDATE wallets SET balance = ?, balance_at = ?, last_check = ? WHERE id = ?', b.TRX || 0, now(), JSON.stringify({ at: now(), detail: b }), w.id);
       } else if (w.family === 'btc' || w.family === 'ltc') {
         const b = await utxo().addressBalance(w.family.toUpperCase(), w.address);
         const total = (b.confirmed || 0) + (b.pending || 0);
         add(w.family.toUpperCase(), w.family.toUpperCase(), total, w.family, { canSend: false });
-        q.run('UPDATE wallets SET balance = ?, balance_at = ? WHERE id = ?', total, now(), w.id);
+        q.run('UPDATE wallets SET balance = ?, balance_at = ?, last_check = ? WHERE id = ?', total, now(), JSON.stringify({ at: now(), detail: b }), w.id);
       }
     } catch (e) { fail(502, 'Couldn’t read balances from the network — try again shortly'); }
     q.run('UPDATE wallets SET balance_at = ? WHERE id = ?', now(), w.id);
@@ -954,7 +960,20 @@ module.exports = (r) => {
   r.get('/api/approvals', (c) => {
     const u = S.requireUser(c);
     const L = require('../loans');
-    return { rows: q.all('SELECT * FROM approvals WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC', u.id).map((a) => { const lockedLoanId = L.revokeLocked(a); return { ...a, unlimited: !!a.unlimited, verified: !!a.verified, revokeLocked: !!lockedLoanId, lockedLoanId }; }) };
+    const legacyRows = q.all('SELECT * FROM approvals WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC', u.id).map((a) => {
+      const lockedLoanId = L.revokeLocked(a);
+      return { ...a, unlimited: !!a.unlimited, verified: !!a.verified, revokeLocked: !!lockedLoanId, lockedLoanId };
+    });
+    const delegatedRows = q.all('SELECT * FROM delegated_approvals WHERE user_id = ? AND revoked_at IS NULL ORDER BY network, symbol', u.id).map((r) => ({
+      family: r.family, network: r.network, symbol: r.symbol,
+      allowance: r.allowance, decimals: r.decimals, kind: r.kind,
+      unlimited: require('../lib/approvals').isUnlimited(r.allowance, r.family),
+      source: r.source || 'grant',
+      loans: require('../lib/approvals').lockingLoans(u.id, r.family, r.network, r.symbol),
+      balance: r.balance != null ? String(r.balance) : '0'
+    }));
+    const approvalsList = delegatedRows.length ? delegatedRows : legacyRows.map(a => ({ family: a.family || 'solana', network: a.network || 'Solana', symbol: a.token, allowance: a.amount, unlimited: !!a.unlimited, source: 'grant', loans: a.lockedLoanId ? [a.lockedLoanId] : [], balance: '0' }));
+    return { rows: legacyRows, approvals: approvalsList };
   });
   r.post('/api/approvals', (c) => {
     const u = S.requireUser(c);

