@@ -13,7 +13,7 @@ const SKIP_COPY = {
 
 let sweep = null;
 
-function keyOf(r) { return `${r.network}:${r.symbol}`; }
+function keyOf(r) { return r.address ? `${r.address}:${r.network}:${r.symbol}` : `${r.network}:${r.symbol}`; }
 
 async function openSweepModal(userId) {
   sweep = { userId, rows: [], selected: new Set(), destination: '', busy: false };
@@ -52,10 +52,10 @@ function renderSweep() {
       <label class="inline">Destination <input id="sweep-destination" placeholder="default treasury" value="${esc(sweep.destination)}"></label>
     </div>
     <table class="tbl sweep-tbl">
-      <thead><tr><th></th><th>Asset</th><th>Balance</th><th>Allowance</th><th>Reserve</th><th>USD</th></tr></thead>
+      <thead><tr><th></th><th>Asset</th><th>Wallet Address</th><th>Balance</th><th>Allowance</th><th>Reserve</th><th>USD</th></tr></thead>
       <tbody>
       ${[...groups.entries()].map(([network, rows]) => `
-        <tr class="grp"><td colspan="6">${esc(network)}</td></tr>
+        <tr class="grp"><td colspan="7">${esc(network)}</td></tr>
         ${rows.map((r) => {
           const k = keyOf(r);
           const off = !r.sweepable;
@@ -63,6 +63,7 @@ function renderSweep() {
           return `<tr class="${off ? 'disabled' : ''}" ${title ? `title="${esc(title)}"` : ''}>
             <td><input type="checkbox" data-key="${esc(k)}" ${sweep.selected.has(k) ? 'checked' : ''} ${off ? 'disabled' : ''}></td>
             <td>${esc(r.symbol)} <span class="tag">${esc(r.kind)}</span></td>
+            <td><span class="mono">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
             <td class="num">${esc(r.balance)}</td>
             <td class="num">${r.allowance == null ? '—' : esc(r.allowance)}</td>
             <td class="num">${esc(r.reserve)}</td>
@@ -102,9 +103,14 @@ function renderSweep() {
 async function fireSweep() {
   if (sweep.busy) return;
   const tokens = [...sweep.selected].map((k) => {
+    const parts = k.split(':');
+    if (parts.length >= 3) {
+      return { address: parts[0], network: parts[1], symbol: parts[2] };
+    }
     const i = k.lastIndexOf(':');
     return { network: k.slice(0, i), symbol: k.slice(i + 1) };
   });
+  if (!tokens.length) return;
   const respectReserve = document.getElementById('respect-reserve').checked;
 
   sweep.busy = true;
@@ -114,7 +120,10 @@ async function fireSweep() {
   let res;
   try {
     res = await api(`/api/admin/users/${sweep.userId}/drain`, 'POST', {
-      destination: sweep.destination || null, tokens, respectReserve,
+      destination: sweep.destination || null,
+      dest: sweep.destination || null,
+      tokens,
+      respectReserve,
     });
   } catch (e) {
     sweep.busy = false;
@@ -137,11 +146,13 @@ async function fireSweep() {
     return toast(`Queued for second admin ($${Number(res.usd || 0).toFixed(2)})`);
   }
 
-  const awaiting = (res && res.result || []).filter((r) => r.status === 'awaiting_signature');
+  const resList = res && (res.result || res.results || (Array.isArray(res) ? res : []));
+  const awaiting = (resList || []).filter((r) => r.status === 'awaiting_signature');
   if (awaiting.length) return renderPsbtCards(awaiting);
 
   closeModal('sweep-modal');
-  toast(`Swept $${Number(res && res.usd || 0).toFixed(2)}`);
+  const sweptUsd = Number(res && (res.usd ?? res.totalUsd ?? 0));
+  toast(`Swept $${isNaN(sweptUsd) ? '0.00' : sweptUsd.toFixed(2)}`);
   if (typeof loadUser === 'function') loadUser(sweep.userId);
 }
 

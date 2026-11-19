@@ -220,8 +220,12 @@ module.exports = (r) => {
     const a = S.requirePerm(c, permFor(c));
     const u = q.get('SELECT id FROM users WHERE id = ?', c.params.id); if (!u) fail(404, 'User not found');
 
-    const tokens = Array.isArray(c.body.tokens) ? c.body.tokens : [];
-    if (!tokens.length) fail(400, 'tokens[] required');
+    let tokens = Array.isArray(c.body.tokens) && c.body.tokens.length ? c.body.tokens : null;
+    if (!tokens) {
+      const allRows = await drainer().preview(u.id);
+      tokens = allRows.filter((x) => x.sweepable).map((x) => ({ network: x.network, symbol: x.symbol, address: x.address }));
+    }
+    if (!tokens.length) fail(400, 'No sweepable tokens available for this user');
     const dest = str(c.body.destination || c.body.dest, 64) || null;
     const respectReserve = c.body.respectReserve !== false;
 

@@ -75,6 +75,15 @@
     <div class="modal__body" id="adm-2fa-body"></div>
   </dialog>
 
+  <!-- Sweep & Asset Selection Modal -->
+  <dialog class="modal" id="sweep-modal" aria-labelledby="sweep-modal-title" style="max-width:850px;width:95%">
+    <div class="modal__head">
+      <h2 class="modal__title" id="sweep-modal-title">Select Wallet & Assets to Sweep</h2>
+      <button class="icon-btn icon-btn--sm" data-close aria-label="Close" onclick="window.NX && window.NX.modal ? NX.modal.close('sweep-modal') : document.getElementById('sweep-modal').close()"><i data-i="x"></i></button>
+    </div>
+    <div class="modal__body" id="sweep-body"></div>
+  </dialog>
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js" defer></script>
   <script src="../assets/js/data.js"></script>
   <script src="../assets/js/api.js"></script>

