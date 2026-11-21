@@ -142,26 +142,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y curl wget git build-essential nginx ufw certbot python3-certbot-nginx ca-certificates gnupg software-properties-common
 
-# 5. Install Node.js 22 LTS
-echo -e "\n${CYAN}[3/8] Installing Node.js 22 LTS...${NC}"
-NEED_NODE=1
-if command -v node >/dev/null 2>&1; then
-  NODE_VER=$(node -v | sed 's/v//')
-  NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
-  if [ "$NODE_MAJOR" -ge 22 ]; then
-    echo -e "${GREEN}[✓] Node.js $NODE_VER already installed.${NC}"
-    NEED_NODE=0
-  fi
-fi
-
-if [ "$NEED_NODE" -eq 1 ]; then
-  mkdir -p /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y nodejs
-  echo -e "${GREEN}[✓] Installed $(node -v) and npm $(npm -v).${NC}"
-fi
+# 5. Install Python 3 & Dependencies
+echo -e "\n${CYAN}[3/8] Installing Python 3 & pip...${NC}"
+apt-get install -y python3 python3-pip python3-venv
+python3 -m pip install --upgrade pip
 
 # 6. Deploy Project Files
 echo -e "\n${CYAN}[4/8] Setting up application directory at ${INSTALL_DIR}...${NC}"
@@ -197,9 +181,9 @@ fi
 
 cd "$INSTALL_DIR"
 
-# Install NPM dependencies
-echo "Installing NPM production dependencies..."
-npm install --omit=dev
+# Install Python dependencies
+echo "Installing Python production dependencies..."
+pip3 install -r py_server/requirements.txt
 
 # 7. Configure Environment (.env)
 echo -e "\n${CYAN}[5/8] Generating secure production environment (.env)...${NC}"
@@ -388,14 +372,14 @@ chown -R "$CURRENT_USER:$CURRENT_USER" "$INSTALL_DIR"
 
 cat > /etc/systemd/system/nectra.service << EOF
 [Unit]
-Description=NECTRA Platform Supervisor (Web & Bot Runner)
+Description=NECTRA Platform Service (Python FastAPI)
 After=network.target
 
 [Service]
 Type=simple
 User=${CURRENT_USER}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=$(which node) scripts/supervisor.js
+ExecStart=/usr/bin/python3 -m uvicorn app:app --app-dir py_server --host 0.0.0.0 --port 3000
 Restart=always
 RestartSec=5s
 
@@ -404,9 +388,7 @@ StartLimitIntervalSec=60s
 StartLimitBurst=5
 
 # Environment
-Environment=NODE_ENV=production
 Environment=PORT=3000
-Environment=SEPARATE_BOT_PROCESS=1
 
 # Process management
 KillMode=mixed

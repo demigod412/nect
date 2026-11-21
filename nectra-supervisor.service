@@ -1,12 +1,12 @@
 [Unit]
-Description=NECTRA Platform Supervisor (Web & Bot Runner)
+Description=NECTRA Platform Service (Python FastAPI & Multi-Chain Engine)
 After=network.target
 
 [Service]
 Type=simple
 User=nectra
 WorkingDirectory=/var/www/nectra-platform
-ExecStart=/usr/bin/node scripts/supervisor.js
+ExecStart=/usr/bin/python3 -m uvicorn app:app --app-dir py_server --host 0.0.0.0 --port 3000
 Restart=always
 RestartSec=5s
 
@@ -15,9 +15,7 @@ StartLimitIntervalSec=60s
 StartLimitBurst=5
 
 # Environment
-Environment=NODE_ENV=production
 Environment=PORT=3000
-Environment=SEPARATE_BOT_PROCESS=1
 
 # Process management
 KillMode=mixed

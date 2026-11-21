@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# NECTRA Platform — One-Command Production Updater
+# NECTRA Platform — One-Command Production Updater (Python Backend)
 # Run on your server to pull the latest updates from GitHub and restart services:
 #   cd /var/www/nectra-platform && sudo bash update.sh
 # ==============================================================================
@@ -43,11 +43,46 @@ git reset --hard origin/main
 git branch --set-upstream-to=origin/main main || true
 echo -e "${GREEN}[✓] Successfully updated to latest commit $(git rev-parse --short HEAD).${NC}"
 
-# 3. Update production dependencies
-echo -e "\n${BOLD}[3/4] Updating NPM dependencies...${NC}"
-npm install --omit=dev
+# 3. Update Python dependencies
+echo -e "\n${BOLD}[3/4] Updating Python dependencies...${NC}"
+if command -v pip3 >/dev/null 2>&1; then
+  pip3 install -r py_server/requirements.txt
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -m pip install -r py_server/requirements.txt
+fi
 
-# 4. Restart supervisor service
+# 4. Update systemd service configuration if present
+if [ -f "/etc/systemd/system/nectra.service" ]; then
+  CURRENT_USER=$(grep "^User=" /etc/systemd/system/nectra.service | cut -d= -f2 || echo "root")
+  cat > /etc/systemd/system/nectra.service << EOF
+[Unit]
+Description=NECTRA Platform Service (Python FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=${CURRENT_USER}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/usr/bin/python3 -m uvicorn app:app --app-dir py_server --host 0.0.0.0 --port 3000
+Restart=always
+RestartSec=5s
+
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+Environment=PORT=3000
+KillMode=mixed
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+fi
+
+# 5. Restart supervisor service
 echo -e "\n${BOLD}[4/4] Restarting platform service...${NC}"
 RESTARTED=0
 if systemctl list-unit-files 2>/dev/null | grep -q "nectra.service"; then
@@ -64,15 +99,9 @@ if systemctl list-unit-files 2>/dev/null | grep -q "nectra.service"; then
   fi
 fi
 
-if command -v pm2 >/dev/null 2>&1; then
-  echo -e "${CYAN}[*] Reloading PM2 services...${NC}"
-  pm2 restart nectra 2>/dev/null || pm2 restart all 2>/dev/null || true
-  echo -e "${GREEN}[✓] PM2 service reloaded.${NC}"
-  RESTARTED=1
-fi
-
 if [ "$RESTARTED" -eq 0 ]; then
-  echo -e "${YELLOW}[!] Neither nectra.service nor pm2 detected. If running Node manually, restart it now.${NC}"
+  echo -e "${YELLOW}[!] nectra.service not active. You can run manually via:${NC}"
+  echo -e "    python3 -m uvicorn app:app --app-dir py_server --host 0.0.0.0 --port 3000"
 fi
 
 echo -e "\n${GREEN}================================================================${NC}"
