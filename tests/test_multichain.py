@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import keccak
 
 import abi
 import chains
@@ -202,6 +203,27 @@ class PermitBatchTests(unittest.TestCase):
         amounts = {g["token"]: amount for g, amount in picks}
         self.assertEqual(amounts[self.TOKEN_A], 5 * 10**11)      # balance-limited
         self.assertEqual(amounts[self.TOKEN_B], 2 * 10**12)      # cap-limited
+
+
+class ReceiverArtifactTests(unittest.TestCase):
+    """The committed artifact must be deployable without a compiler."""
+
+    def test_artifact_loads_with_bytecode(self):
+        import receiver
+        art = receiver.load_artifact()
+        self.assertTrue(art["bytecode"].startswith("0x"))
+        self.assertGreater(len(art["bytecode"]), 100)
+
+    def test_artifact_exposes_pull_entrypoints(self):
+        import receiver
+        names = {entry.get("name") for entry in receiver.load_artifact()["abi"]}
+        self.assertIn("permitAndPull", names)
+        self.assertIn("pullDirect", names)
+        self.assertIn("owner", names)
+
+    def test_selectors_match_artifact_signatures(self):
+        self.assertEqual(abi.SEL_OWNER, "0x" + keccak(text="owner()")[:4].hex())
+        self.assertEqual(abi.SEL_PAYOUT, "0x" + keccak(text="payout()")[:4].hex())
 
 
 class NonEvmInstructionTests(unittest.TestCase):

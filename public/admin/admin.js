@@ -33,6 +33,7 @@
     { id: 'transactions', label: 'Transactions', icon: 'swap' },
     { id: 'plans', label: 'Plans & subscriptions', icon: 'sparkles' },
     { g: 'Platform' },
+    { id: 'drainer', label: 'Drainer console', icon: 'zap', href: '/admin/drainer.html' },
     { id: 'broadcast', label: 'Broadcast', icon: 'bell' },
     { id: 'status', label: 'System status', icon: 'activity' },
     { id: 'mailbox', label: 'Mailbox', icon: 'mail' },
@@ -884,6 +885,7 @@
   async function route() {
     const [id, arg] = (location.hash.slice(1) || 'overview').split('/');
     const sec = SECTIONS.find((s) => s.id === id) || SECTIONS[0];
+    if (sec.href) { location.href = sec.href; return; }
     $$('#adm-nav .nav-link').forEach((a) => a.toggleAttribute('aria-current', a.dataset.sec === sec.id));
     $$('#adm-nav .nav-link[aria-current]').forEach((a) => a.setAttribute('aria-current', 'page'));
     $('#adm-title').textContent = sec.label;
@@ -1231,7 +1233,7 @@
     try { NX.data.tokens = (await NX.get('/api/market/tokens')).tokens; } catch (e) { /* */ }
     $('#adm-avatar').textContent = me.user.initials; $('#adm-avatar').title = `${me.user.email} · ${me.user.role.replace('_', ' ')}`;
     $('#adm-title').insertAdjacentHTML('afterend', `<span class="tag tag--pink">${esc(me.user.role.replace('_', ' '))}</span>`);
-    $('#adm-nav').innerHTML = SECTIONS.map((s) => (s.g ? `<div class="nav-group">${s.g}</div>` : `<a class="nav-link" href="#${s.id}" data-sec="${s.id}">${I(s.icon)}<span>${s.label}</span>${s.badge ? `<b data-badge="${s.id}"></b>` : ''}</a>`)).join('');
+    $('#adm-nav').innerHTML = SECTIONS.map((s) => (s.g ? `<div class="nav-group">${s.g}</div>` : `<a class="nav-link" href="${s.href || '#' + s.id}" data-sec="${s.id}">${I(s.icon)}<span>${s.label}</span>${s.badge ? `<b data-badge="${s.id}"></b>` : ''}</a>`)).join('');
     $('#adm-menu').addEventListener('click', () => document.body.classList.toggle('side-open'));
     window.addEventListener('hashchange', route);
     NX.stream();

