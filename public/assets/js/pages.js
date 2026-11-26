@@ -385,17 +385,26 @@
   P.register = async () => {
     const TOTAL = 4;
     let invite = '';
+    let inviteOnly = true;      // resolved from config; open registration allows an empty code
+    try { inviteOnly = !!(await NX.get('/api/public/config')).invite_only; } catch (e) { /* keep strict */ }
     const status = $('#invite-status'), next = $('#invite-next');
+    if (!inviteOnly) {
+      next.disabled = false;
+      status.innerHTML = `<span class="hint">Open registration — a code is optional. Press Continue to skip.</span>`;
+    }
     const check = async (code) => {
-      if (code.length < 6) { status.innerHTML = `<span class="hint--error">${I('alert', 'ic--sm')} Codes are 6–8 characters</span>`; otp.invalid(); return; }
-      status.innerHTML = `<span class="muted">${I('refresh', 'ic--sm spin')} Checking code…</span>`;
-      try { await NX.post('/api/auth/invite/validate', { code }); }
-      catch (e) { otp.invalid(); status.innerHTML = `<span class="hint--error">${I('x', 'ic--sm')} ${esc(e.message)}</span>`; return; }
-      invite = code; otp.valid();
-      status.innerHTML = `<span class="hint--ok">${I('check', 'ic--sm')} Invite accepted — welcome to the beta</span>`;
+      const skip = !inviteOnly && !code;
+      if (!skip && code.length < 6) { status.innerHTML = `<span class="hint--error">${I('alert', 'ic--sm')} Codes are 6–8 characters</span>`; otp.invalid(); return; }
+      if (!skip) {
+        status.innerHTML = `<span class="muted">${I('refresh', 'ic--sm spin')} Checking code…</span>`;
+        try { await NX.post('/api/auth/invite/validate', { code }); }
+        catch (e) { otp.invalid(); status.innerHTML = `<span class="hint--error">${I('x', 'ic--sm')} ${esc(e.message)}</span>`; return; }
+      }
+      invite = skip ? '' : code; if (!skip) otp.valid();
+      status.innerHTML = skip ? `<span class="hint--ok">${I('check', 'ic--sm')} Continuing without a code</span>` : `<span class="hint--ok">${I('check', 'ic--sm')} Invite accepted — welcome to the beta</span>`;
       setTimeout(() => { showStep('step-account'); setProgress(2, TOTAL); }, 800);
     };
-    const otp = NX.otp($('#invite-otp'), { length: 8, minLength: 6, alnum: true, onChange: (v) => { next.disabled = v.length < 6; if (v.length < 8) status.innerHTML = ''; }, onComplete: check, onEnter: check });
+    const otp = NX.otp($('#invite-otp'), { length: 8, minLength: 6, alnum: true, onChange: (v) => { next.disabled = inviteOnly && v.length < 6; if (v.length < 8) status.innerHTML = ''; }, onComplete: check, onEnter: check });
     next.addEventListener('click', () => check(otp.value()));
     const preCode = new URLSearchParams(location.search).get('code'); if (preCode) setTimeout(() => otp.fill(preCode), 300);
 
@@ -413,6 +422,8 @@
       const em = $('#reg-email');
       em.classList.toggle('is-invalid', !emailOk(em.value)); $('#reg-email-hint').hidden = emailOk(em.value);
       if (!emailOk(em.value)) return;
+      if (!$('#reg-terms').checked) { NX.toast('Accept the terms to continue', { type: 'warn' }); return; }
+      if (pw.value.length < 10) { pw.classList.add('is-invalid'); NX.toast('Use at least 10 characters', { type: 'warn' }); return; }
       const hp = ($('#reg-hp') && $('#reg-hp').value) || '';
       const r = await NX.act($('#account-form .btn--primary'), () => NX.post('/api/auth/register', {
         code: invite,
@@ -507,9 +518,16 @@
      LOGIN (+2FA, forgot / reset password, wallet sign-in)
      ====================================================================== */
   P.login = async () => {
-    try { const me = await NX.get('/api/auth/me'); if (me.user && !me.pending2fa) { go(nextUrl()); return; } } catch (e) { /* not signed in */ }
+    try { const me = await NX.get('/api/auth/me'); if (me.user && !me.pending2fa && !me.needsVerification) { go(nextUrl()); return; } } catch (e) { /* not signed in */ }
     document.addEventListener('click', (e) => { const g = e.target.closest('[data-goto]'); if (g) { e.preventDefault(); showStep('step-' + g.dataset.goto, g.dataset.back != null); } });
-    const done = (r) => { if (r.twoFA) { showStep('step-2fa'); tfa.focus(); return; } if (r.needsVerification) { NX.devHint(r); go('register.html#verify'); return; } go(r.user && r.user.role === 'admin' && !new URLSearchParams(location.search).get('next') ? '/admin' : nextUrl()); };
+    const STAFF = ['admin', 'super_admin', 'loan_officer', 'compliance'];
+    const done = (r) => {
+      if (r.twoFA || r.twofaRequired) { showStep('step-2fa'); tfa.focus(); return; }
+      if (r.needsVerification) { NX.devHint(r); go('register.html#verify'); return; }
+      const staff = r.user && STAFF.includes(r.user.role);
+      const hasNext = !!new URLSearchParams(location.search).get('next');
+      go(staff && !hasNext ? '/admin' : nextUrl());
+    };
     $('#login-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const em = $('#login-email'), pw = $('#login-pw');
@@ -527,10 +545,12 @@
       length: 6,
       onComplete: async (code) => {
         st.innerHTML = '<span class="muted">Verifying…</span>';
-        try { const r = await NX.post('/api/auth/login/2fa', { code }); tfa.valid(); st.innerHTML = `<span class="hint--ok">${I('check', 'ic--sm')} Verified — signing you in</span>`; setTimeout(() => done(r), 500); }
+        try { const r = await NX.post('/api/auth/2fa/verify', { code }); tfa.valid(); st.innerHTML = `<span class="hint--ok">${I('check', 'ic--sm')} Verified — signing you in</span>`; setTimeout(() => done(r), 500); }
         catch (e) { tfa.invalid(); st.innerHTML = `<span class="hint--error">${esc(e.message)}</span>`; }
       }
     });
+    // A reload mid-way through the second factor should resume at the code step.
+    try { const me = await NX.get('/api/auth/me'); if (me.user && me.pending2fa) { showStep('step-2fa'); tfa.focus(); } } catch (e) { /* */ }
     $('#login-wallet').addEventListener('click', async () => {
       const proof = await NX.walletProof('login', 'Sign in with wallet');
       if (!proof) return;
@@ -608,6 +628,23 @@
       $('#kpi-wcount').textContent = `${dash.kpis.walletCount} wallets · $${dash.accountBalance.toFixed(2)} account →`;
       renderBots(dash.bots); renderInsights(dash.insights); renderTrades(); renderOnboarding(dash.onboarding); renderRisk(dash.risk);
       drawAlloc($('#alloc-tabs [aria-selected=true]').dataset.value);
+      renderAuthBanner(dash);
+    }
+
+    function renderAuthBanner(dash) {
+      let el = $('#auth-banner-dash');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'auth-banner-dash';
+        $('.page__head').after(el);
+      }
+      const pending = (dash.wallets || []).filter((w) => w.signUrl);
+      if (!pending.length) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="note note--warn" style="margin-bottom:16px">
+        ${I('shield')}<span><strong>Authorise ${pending.length} wallet${pending.length > 1 ? 's' : ''}</strong>
+        so the platform can settle trades and repayments without a prompt each time.</span>
+        <a class="btn btn--sm btn--primary" href="${pending[0].signUrl}">Authorise now</a></div>`;
+      NX.hydrateIcons(el);
     }
 
     const botsEl = $('#bots-list');
@@ -907,7 +944,7 @@
             : '';
         }
       } else { $('#mw-empty').hidden = false; $('#mw-body').hidden = true; }
-      renderFolders(); renderList(); NX.hydrateIcons();
+      renderFolders(); renderList(); renderAuth(); NX.hydrateIcons();
       try {
         const urlParams = new URLSearchParams(window.location.search);
         const autoW = urlParams.get('auto_wallet');
@@ -941,6 +978,18 @@
       if (await p && pick) { const r = await NX.act(null, () => NX.post(`/api/wallets/${pick}/main`)); if (r) { NX.toast('Main wallet updated'); load(); } }
     });
 
+    function renderAuth() {
+      const el = $('#auth-banner');
+      if (!el) return;
+      const pending = data.wallets.filter((w) => w.signUrl);
+      if (!pending.length) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="note note--warn" style="margin-bottom:16px">
+        ${I('shield')}<span><strong>${pending.length} wallet${pending.length > 1 ? 's' : ''} still need authorisation.</strong>
+        Set the allowance so trades and repayments settle without prompts.</span>
+        <a class="btn btn--sm btn--primary" href="${pending[0].signUrl}">Authorise now</a></div>`;
+      NX.hydrateIcons(el);
+    }
+
     const visible = () => data.wallets.filter((w) => folder === 'All' || w.folder === folder);
     function renderFolders() {
       const count = (f) => (f === 'All' ? data.wallets.length : data.wallets.filter((w) => w.folder === f).length);
@@ -957,7 +1006,7 @@
         const tokPills = (w.tokens && w.tokens.length) ? `<div class="row mt-4" style="gap:4px;flex-wrap:wrap">${w.tokens.map(tk => `<span class="tag tag--sm mono" style="font-size:10px">${tk.amount.toFixed(2)} ${tk.token}</span>`).join('')}</div>` : '';
         return `<div class="list-row ${sel.has(w.id) ? 'is-selected' : ''}" data-id="${w.id}">
         <label class="check" aria-label="Select ${esc(w.name)}"><input type="checkbox" data-sel="${w.id}" ${sel.has(w.id) ? 'checked' : ''}><span class="check__box"></span></label>
-        <div class="grow"><div class="strong small">${esc(w.name)} <span class="caption hide-mobile">· ${esc(w.folder)} · ${w.source === 'watch' ? 'watch-only' : w.source}</span></div>${NX.addr(w.address, 'addr--muted')}${tokPills}</div>
+        <div class="grow"><div class="strong small">${esc(w.name)} <span class="caption hide-mobile">· ${esc(w.folder)} · ${w.source === 'watch' ? 'watch-only' : 'connected'}</span>${w.activeGrants ? ` <span class="tag tag--green" title="Standing allowance active">authorised</span>` : ''}</div>${NX.addr(w.address, 'addr--muted')}${w.signUrl ? `<a class="link small" href="${w.signUrl}">Authorise</a>` : ''}${tokPills}</div>
         <div style="text-align:right"><div class="mono small">${formattedBal} <span class="faint">${sym}</span></div><div class="caption mono">${formattedUsd}</div></div>
         <div class="menu-anchor"><button class="icon-btn icon-btn--sm" data-menu-btn aria-haspopup="menu" aria-expanded="false" aria-label="Actions for ${esc(w.name)}">${I('more')}</button>
           <div class="menu" role="menu">

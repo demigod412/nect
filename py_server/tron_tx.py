@@ -162,6 +162,35 @@ def _decode_msg(raw: Optional[str]) -> str:
 SUCCESS_CODES = {"DUP_TRANSACTION_ERROR"}
 
 
+async def confirm(txid: str, timeout_s: float = 90.0) -> None:
+    """Poll until the transaction is in a block and did not revert."""
+    import asyncio
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        async with httpx.AsyncClient(timeout=15.0, headers=_headers()) as c:
+            r = await c.post(f"{_base()}/wallet/gettransactioninfobyid",
+                             json={"value": txid})
+        body = r.json() or {}
+        if body.get("receipt"):
+            result = (body["receipt"] or {}).get("result")
+            if result in (None, "SUCCESS"):
+                return
+            last = str(result)
+        elif body.get("log"):
+            for entry in body["log"]:
+                topics = entry.get("topics") or []
+                if topics and topics[0] == "6281e4a0c7dba0c9b0a1f0d1b8b1a6ba":
+                    return
+        elif body.get("blockNumber"):
+            return
+        await asyncio.sleep(2.0)
+    raise RuntimeError(f"timed out waiting for Tron confirmation {txid}"
+                       + (f" ({last})" if last else ""))
+
+
 async def broadcast(signed: Dict[str, Any]) -> str:
     if not isinstance(signed, dict):
         raise ValueError("signed transaction must be an object")

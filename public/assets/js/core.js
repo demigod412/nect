@@ -652,7 +652,7 @@
             <a class="menu__item" role="menuitem" href="referrals.html">${NX.icon('gift')} Invite friends</a>
             <button class="menu__item" role="menuitem" data-action="theme">${NX.icon('moon')} Toggle theme</button>
             <div class="menu__sep"></div>
-            ${NX.data.user.role === 'admin' ? `<a class="menu__item" role="menuitem" href="/admin">${NX.icon('shield')} Admin console</a>` : ''}
+            ${['admin', 'super_admin'].includes(NX.data.user.role) ? `<a class="menu__item" role="menuitem" href="/admin">${NX.icon('shield')} Admin console</a>` : ''}
             <button class="menu__item menu__item--danger" role="menuitem" data-action="logout">${NX.icon('logout')} Sign out</button>
           </div></div>
       </div>`;

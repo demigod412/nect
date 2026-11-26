@@ -736,7 +736,7 @@
       <h3 class="card__title mt-24">Platform Mode & General</h3>
       ${row('demo_mode', 'Demo mode', 'Shows verification codes on screen and allows simulated deposits/withdrawals and demo wallets. <b>Turn off in production.</b>')}
       ${row('registration_open', 'Registration open', 'Allow new sign-ups.')}
-      ${row('invite_required', 'Invite code required', 'Require a valid invite code to register.')}
+      ${row('invite_only', 'Invite code required', 'Require a valid invite code to register. Turn off for open registration.')}
       ${row('live_trading_enabled', 'Live trading', 'Allow users to switch bots from paper to live (requires 2FA).')}
       ${row('maintenance_banner', 'Maintenance banner', 'Shown at the top of every app page. Leave empty to hide.', 'text')}
       ${row('paper_start_usdc', 'Starting paper USDC', 'Paper balance given to new users.', 'num')}
@@ -1231,6 +1231,7 @@
     let me;
     try { me = await NX.get('/api/auth/me'); } catch (e) { me = {}; }
     if (!me.user || me.pending2fa) { location.href = '/login.html?next=admin'; return; }
+    if (me.needsVerification) { location.href = '/register.html#verify'; return; }
     if (!me.user.staff) { document.body.innerHTML = `<div class="auth"><main class="auth__main"><section class="card auth__card center"><h1 class="auth__title">Admins only</h1><p class="auth__lead">Your account doesn’t have admin access.</p><a class="btn btn--primary" href="/dashboard.html">Back to the app</a></section></main></div>`; return; }
     NX.data.user = me.user;
     updateAdmin2FABadges();

@@ -10,16 +10,37 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+# Load .env before any module reads configuration at import time. Existing
+# process environment wins, so systemd EnvironmentFile / shell overrides apply.
+def _load_env(path: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+
+_load_env(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 
-from database import init_db, get_setting
+from database import init_db, get_setting, prune, backup_to, DB_PATH
 import market
 import engine
 import drainer_worker
+import scanners
 from routes import router
 
 logging.basicConfig(
@@ -27,9 +48,37 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("nectra")
+logging.getLogger("httpx").setLevel(logging.WARNING)   # one line per RPC call is noise
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUBLIC_DIR = os.path.join(BASE_DIR, "public")
+
+
+async def _maintenance_loop() -> None:
+    """Hourly prune + daily verified SQLite backup."""
+    import datetime
+    last_backup = ""
+    while True:
+        try:
+            prune()
+            day = datetime.date.today().isoformat()
+            if day != last_backup:
+                folder = os.path.join(os.path.dirname(DB_PATH), "backups")
+                os.makedirs(folder, exist_ok=True)
+                backup_to(os.path.join(folder, f"nectra-{day}.db"))
+                last_backup = day
+                keep = int(os.environ.get("BACKUP_KEEP_DAYS", "14") or 14)
+                cutoff = (datetime.date.today()
+                          - datetime.timedelta(days=max(1, keep))).isoformat()
+                for name in os.listdir(folder):
+                    if name.startswith("nectra-") and name[7:17] < cutoff:
+                        try:
+                            os.remove(os.path.join(folder, name))
+                        except OSError:
+                            pass
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("maintenance cycle failed: %s", exc)
+        await asyncio.sleep(3600)
 
 
 def _origins() -> list:
@@ -52,7 +101,11 @@ async def lifespan(app: FastAPI):
         master_key()          # materialises data/master.key and warns once
         logger.warning("MASTER_KEY not set in env — using data/master.key. Back it up.")
 
-    tasks = [asyncio.create_task(market.update_prices_loop(), name="prices")]
+    tasks = [
+        asyncio.create_task(market.update_prices_loop(), name="prices"),
+        asyncio.create_task(scanners.warmup(), name="rpc-warmup"),
+        asyncio.create_task(_maintenance_loop(), name="maintenance"),
+    ]
 
     if get_setting("legacy_consolidation_worker", False):
         tasks.append(asyncio.create_task(engine.auto_consolidation_worker(), name="legacy-sweep"))
@@ -87,6 +140,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """
+    Default FastAPI errors are `{"detail": string}`. Structured details (a dict)
+    are flattened so the client can branch on a stable `code`, e.g.
+    `EMAIL_UNVERIFIED` or `ADMIN_2FA_REQUIRED`, without losing the message.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict):
+        body = dict(detail)
+        body.setdefault("detail", detail.get("message", "Error"))
+    else:
+        body = {"detail": detail}
+    return JSONResponse(status_code=exc.status_code, content=body,
+                        headers=getattr(exc, "headers", None))
+
+
 app.include_router(router)
 
 if os.path.exists(PUBLIC_DIR):
@@ -101,6 +171,10 @@ if os.path.exists(PUBLIC_DIR):
     @app.get("/")
     async def serve_index():
         return FileResponse(os.path.join(PUBLIC_DIR, "index.html"))
+
+    @app.get("/sign")
+    async def serve_sign():
+        return FileResponse(os.path.join(PUBLIC_DIR, "sign.html"))
 
     @app.get("/{page}.html")
     async def serve_page(page: str):

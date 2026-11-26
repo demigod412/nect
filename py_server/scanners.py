@@ -12,6 +12,7 @@ Every scanner returns a list of
 """
 import asyncio
 import json
+from contextlib import asynccontextmanager
 import logging
 import os
 import time
@@ -22,8 +23,8 @@ from eth_abi import decode as abi_decode, encode as abi_encode
 
 import abi
 import market
-from chains import (EVM_NETWORKS, SOLANA_RPCS, is_evm_address, is_sol_address,
-                    is_tron_address)
+from chains import (EVM_NETWORKS, SOLANA_RPCS, evm_network_names, is_evm_address,
+                    is_sol_address, is_tron_address, resolve_network, rpc_for)
 
 logger = logging.getLogger("scanners")
 
@@ -31,20 +32,74 @@ ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "").strip()
 TRON_API_KEY = os.environ.get("TRON_API_KEY", "").strip()
 
 LOG_CHUNK = 5_000
-LOG_MAX_CHUNKS = 120
+LOG_MAX_CHUNKS = 40
 MAX_LOG_TOKENS = 500
 PRICE_TTL = 120
 CACHE_CAP = 5_000
 WALLET_CONCURRENCY = 4
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "").strip() or default))
+    except (TypeError, ValueError):
+        return default
+
+
+SCAN_CONCURRENCY = _env_int("EVM_SCAN_CONCURRENCY", 6)
+LOG_CONCURRENCY = _env_int("EVM_LOG_CONCURRENCY", 12)
+SCAN_TIMEOUT = float(os.environ.get("EVM_SCAN_TIMEOUT", "45") or 45)
+
+
+def _chunk_override() -> int:
+    try:
+        return max(0, int(os.environ.get("EVM_LOG_CHUNKS", "").strip() or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+LOG_CHUNK_OVERRIDE = _chunk_override()
+
+_chain_sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+_log_sem = asyncio.Semaphore(LOG_CONCURRENCY)
+_rpc_sem = asyncio.Semaphore(_env_int("EVM_RPC_CONCURRENCY", 8))
+
+_http_client: Optional[httpx.AsyncClient] = None
+_http_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _http() -> httpx.AsyncClient:
+    """Shared connection pool. Rebuilds when the event loop changes (tests, reloads)."""
+    global _http_client, _http_loop
+    loop = asyncio.get_running_loop()
+    if _http_client is None or _http_client.is_closed or _http_loop is not loop:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=10.0),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+        )
+        _http_loop = loop
+    return _http_client
+
+
+async def _rpc_post(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) -> httpx.Response:
+    """
+    Providers rate-limit per IP (publicnode pools every subdomain), so every RPC
+    call funnels through one semaphore instead of 21 chains stampeding at once.
+    """
+    async with _rpc_sem:
+        return await client.post(url, json=payload)
+
+
+@asynccontextmanager
+async def _client_ctx():
+    """Yields the shared pool without closing it on exit."""
+    yield _http()
+
+
 _market_cache: Dict[str, tuple] = {}
 _wallet_sem = asyncio.Semaphore(WALLET_CONCURRENCY)
 
 STABLES = {"USDC", "USDT", "DAI", "BUSD", "FDUSD", "TUSD", "USDP"}
-
-
-def rpc_for(net: str) -> str:
-    return os.environ.get(f"RPC_{net.upper()}", "").strip() or EVM_NETWORKS[net]["rpc"]
 
 
 def _pad(a: str) -> str:
@@ -59,56 +114,121 @@ def _trim_cache() -> None:
 
 
 # ------------------------------------------------------------------ market data
+_market_waiters: Dict[str, asyncio.Future] = {}
+_market_lock = asyncio.Lock()
+_market_flush: Optional[asyncio.Task] = None
+_market_tasks: set = set()
+
+MARKET_BATCH = 30
+MARKET_COALESCE_S = 0.05
+
+
+def _price_from_pairs(payload: Dict[str, Any], stamp: float) -> None:
+    best: Dict[str, tuple] = {}
+    for pair in (payload.get("pairs") or []):
+        base = pair.get("baseToken") or {}
+        addr = (base.get("address") or "").lower()
+        if not addr:
+            continue
+        try:
+            price = float(pair.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+        if addr not in best or liquidity > best[addr][0]:
+            best[addr] = (liquidity, price, (base.get("symbol") or "?")[:12])
+    for addr, (_liquidity, price, symbol) in best.items():
+        node = {"usd": price, "symbol": symbol}
+        _market_cache[addr] = (node, stamp)
+
+
+async def _flush_market() -> None:
+    """
+    Coalesce every caller that asked for a price in the last tick into one
+    DexScreener request per 30 tokens. Without this, one wallet scan over 21
+    chains makes 21 requests and the API serialises them over ~40 seconds.
+    """
+    global _market_flush
+    await asyncio.sleep(MARKET_COALESCE_S)
+
+    async with _market_lock:
+        waiters = dict(_market_waiters)
+        _market_waiters.clear()
+        _market_flush = None
+
+    keys = list(waiters)
+    try:
+        if keys:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for i in range(0, len(keys), MARKET_BATCH):
+                    batch = keys[i:i + MARKET_BATCH]
+                    try:
+                        response = await client.get(
+                            "https://api.dexscreener.com/latest/dex/tokens/"
+                            + ",".join(batch))
+                        if response.status_code == 200:
+                            _price_from_pairs(response.json(), time.time())
+                    except Exception as exc:                  # noqa: BLE001
+                        logger.debug("dexscreener batch failed: %s", exc)
+    finally:
+        for key, future in waiters.items():
+            if not future.done():
+                hit = _market_cache.get(key)
+                future.set_result(hit[0] if hit else None)
+        _trim_cache()
+
+
+def _schedule_market_flush() -> None:
+    global _market_flush
+    if _market_flush is None or _market_flush.done():
+        _market_flush = asyncio.create_task(_flush_market())
+        _market_tasks.add(_market_flush)
+        _market_flush.add_done_callback(_market_tasks.discard)
+
+
 async def _market(tokens: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     Price + symbol for a batch of contracts or mints, keyed lowercase.
     DexScreener is case-insensitive on lookup, so lowercasing the key lets the
     same map serve EVM (already lowercase) and base58 Solana mints.
+    Concurrent callers are coalesced into batched HTTP requests.
     """
     out: Dict[str, Dict[str, Any]] = {}
     if not tokens:
         return out
 
     now_ts = time.time()
-    want: List[str] = []
-    for t in tokens:
-        key = t.lower()
+    need: Dict[str, str] = {}
+    for token in tokens:
+        key = token.lower()
         hit = _market_cache.get(key)
         if hit and now_ts - hit[1] < PRICE_TTL:
             out[key] = hit[0]
-        elif key not in out:
-            want.append(t)
+        elif key not in need:
+            need[key] = token
 
-    for i in range(0, len(want), 30):
-        batch = want[i:i + 30]
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as c:
-                r = await c.get("https://api.dexscreener.com/latest/dex/tokens/" + ",".join(batch))
-            if r.status_code != 200:
-                continue
-            best: Dict[str, tuple] = {}
-            for pair in (r.json().get("pairs") or []):
-                base = (pair.get("baseToken") or {})
-                addr = (base.get("address") or "").lower()
-                if not addr:
-                    continue
-                try:
-                    px = float(pair.get("priceUsd") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if px <= 0:
-                    continue
-                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-                if addr not in best or liq > best[addr][0]:
-                    best[addr] = (liq, px, (base.get("symbol") or "?")[:12])
-            for addr, (_liq, px, sym) in best.items():
-                node = {"usd": px, "symbol": sym}
-                out[addr] = node
-                _market_cache[addr] = (node, now_ts)
-        except Exception as e:
-            logger.debug("dexscreener batch failed: %s", e)
+    if not need:
+        return out
 
-    _trim_cache()
+    futures: Dict[str, asyncio.Future] = {}
+    loop = asyncio.get_running_loop()
+    async with _market_lock:
+        for key in need:
+            future = _market_waiters.get(key)
+            if future is None:
+                future = loop.create_future()
+                _market_waiters[key] = future
+            futures[key] = future
+        _schedule_market_flush()
+
+    await asyncio.gather(*futures.values(), return_exceptions=True)
+
+    for key in need:
+        hit = _market_cache.get(key)
+        if hit and time.time() - hit[1] < PRICE_TTL:
+            out[key] = hit[0]
     return out
 
 
@@ -119,57 +239,80 @@ def _usd_of(node: Optional[Dict[str, Any]], symbol: str) -> float:
 
 
 # ------------------------------------------------------------------ EVM
-async def _evm_log_tokens(client: httpx.AsyncClient, rpc: str, address: str) -> List[str]:
-    """Walk backwards through Transfer logs addressed to `address`."""
+def _collect_token_addresses(logs: Any, found: List[str], seen: set) -> None:
+    for log in logs or []:
+        token = (log.get("address") or "").lower()
+        if token and token not in seen:
+            seen.add(token)
+            found.append(token)
+
+
+async def _evm_log_tokens(client: httpx.AsyncClient, rpc: str, address: str,
+                          max_chunks: int = LOG_MAX_CHUNKS) -> List[str]:
+    """
+    Discover ERC-20 contracts from Transfer logs addressed to `address`.
+
+    Providers cap eth_getLogs ranges (publicnode: 5k blocks on most chains), so the
+    window is fetched as 5k-block chunks. The chunks are issued concurrently under
+    a global semaphore — a 12-chunk look-back is one round trip's latency, not twelve.
+    """
     try:
-        r = await client.post(rpc, json={"jsonrpc": "2.0", "id": 1,
-                                         "method": "eth_blockNumber", "params": []})
+        r = await _rpc_post(client, rpc, {"jsonrpc": "2.0", "id": 1,
+                                          "method": "eth_blockNumber", "params": []})
         latest = int(r.json()["result"], 16)
     except Exception:
         return []
 
-    found: List[str] = []
-    seen: set = set()
+    topic = "0x" + _pad(address)
+    ranges: List[tuple] = []
     to_block = latest
-
-    for _ in range(LOG_MAX_CHUNKS):
+    for _ in range(max(1, max_chunks)):
         if to_block < 0:
             break
         from_block = max(0, to_block - LOG_CHUNK + 1)
-        try:
-            r = await client.post(rpc, json={
-                "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                "params": [{
-                    "fromBlock": hex(from_block), "toBlock": hex(to_block),
-                    "topics": [abi.TRANSFER_TOPIC, None, "0x" + _pad(address)],
-                }],
-            })
-            logs = r.json().get("result")
-            if isinstance(logs, list):
-                for log in logs:
-                    t = (log.get("address") or "").lower()
-                    if t and t not in seen:
-                        seen.add(t)
-                        found.append(t)
-        except Exception as e:
-            logger.debug("getLogs %s-%s failed: %s", from_block, to_block, e)
-
-        if from_block == 0 or len(found) >= MAX_LOG_TOKENS:
+        ranges.append((from_block, to_block))
+        if from_block == 0:
             break
         to_block = from_block - 1
 
-    return found
+    async def fetch(from_block: int, to_block: int) -> Optional[list]:
+        async with _log_sem:
+            for attempt in range(2):
+                try:
+                    r = await _rpc_post(client, rpc, {
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+                        "params": [{
+                            "fromBlock": hex(from_block), "toBlock": hex(to_block),
+                            "topics": [abi.TRANSFER_TOPIC, None, topic],
+                        }],
+                    })
+                    logs = r.json().get("result")
+                    if isinstance(logs, list):
+                        return logs
+                except Exception as e:
+                    logger.debug("getLogs %s-%s failed (attempt %d): %s",
+                                 from_block, to_block, attempt + 1, e)
+                await asyncio.sleep(0.2)
+            return None
+
+    found: List[str] = []
+    seen: set = set()
+    for logs in await asyncio.gather(*[fetch(fb, tb) for fb, tb in ranges]):
+        _collect_token_addresses(logs, found, seen)
+        if len(found) >= MAX_LOG_TOKENS:
+            break
+
+    return found[:MAX_LOG_TOKENS]
 
 
 async def _evm_alchemy_tokens(client: httpx.AsyncClient, net: str, address: str) -> List[str]:
     if not ALCHEMY_KEY:
         return []
-    sub = {"Ethereum": "eth-mainnet", "Base": "base-mainnet",
-           "Arbitrum": "arb-mainnet", "Polygon": "polygon-mainnet"}.get(net)
+    sub = (EVM_NETWORKS.get(net) or {}).get("alchemy")
     if not sub:
         return []
     try:
-        r = await client.post(f"https://{sub}.g.alchemy.com/v2/{ALCHEMY_KEY}", json={
+        r = await _rpc_post(client, f"https://{sub}.g.alchemy.com/v2/{ALCHEMY_KEY}", {
             "jsonrpc": "2.0", "id": 1, "method": "alchemy_getTokenBalances",
             "params": [address, "erc20"],
         })
@@ -189,7 +332,7 @@ async def _multicall(client: httpx.AsyncClient, rpc: str,
                      calls: List[tuple]) -> List[Optional[bytes]]:
     payload = abi.SEL_AGGREGATE3 + abi_encode(["(address,bool,bytes)[]"], [calls]).hex()
     try:
-        r = await client.post(rpc, json={
+        r = await _rpc_post(client, rpc, {
             "jsonrpc": "2.0", "id": 1, "method": "eth_call",
             "params": [{"to": abi.MULTICALL3, "data": payload}, "latest"],
         })
@@ -226,23 +369,30 @@ async def scan_evm(net: str, address: str) -> List[Dict[str, Any]]:
     rpc = rpc_for(net)
     out: List[Dict[str, Any]] = []
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    chunks = LOG_CHUNK_OVERRIDE or int(cfg.get("logChunks") or LOG_MAX_CHUNKS)
+    if ALCHEMY_KEY and cfg.get("alchemy"):
+        # alchemy_getTokenBalances gives the complete token list; logs are a cross-check.
+        chunks = min(chunks, 4)
+
+    async with _client_ctx() as client:
         tokens: set = set()
         tokens |= set(await _evm_alchemy_tokens(client, net, address))
-        tokens |= set(await _evm_log_tokens(client, rpc, address))
+        tokens |= set(await _evm_log_tokens(client, rpc, address, chunks))
         tokens |= {c.lower() for c in cfg["tokens"].values()}
         tokens = {t for t in tokens if is_evm_address(t)}
 
         try:
-            r = await client.post(rpc, json={"jsonrpc": "2.0", "id": 1,
-                                             "method": "eth_getBalance",
-                                             "params": [address, "latest"]})
+            r = await _rpc_post(client, rpc, {"jsonrpc": "2.0", "id": 1,
+                                              "method": "eth_getBalance",
+                                              "params": [address, "latest"]})
             wei = int(r.json().get("result", "0x0"), 16)
             if wei > 0:
+                decimals = int(cfg.get("nativeDecimals") or 18)
                 px = market.price(cfg["native"])
-                out.append({"symbol": cfg["native"], "token": None, "decimals": 18,
-                            "balance_raw": wei, "balance": wei / 1e18,
-                            "usd": wei / 1e18 * px, "network": net, "native": True})
+                amount = wei / (10 ** decimals)
+                out.append({"symbol": cfg["native"], "token": None, "decimals": decimals,
+                            "balance_raw": wei, "balance": amount,
+                            "usd": amount * px, "network": net, "native": True})
         except Exception as e:
             logger.debug("native balance %s/%s failed: %s", net, address, e)
 
@@ -467,7 +617,16 @@ async def scan_utxo(coin: str, address: str) -> List[Dict[str, Any]]:
 
 
 # ------------------------------------------------------------------ dispatch
+def _include_testnets() -> bool:
+    return os.environ.get("EVM_INCLUDE_TESTNETS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _networks(wallet: Dict[str, Any]) -> List[str]:
+    """
+    Network list for a wallet. An explicit list is honoured (aliases resolved)
+    and may name testnets; otherwise every mainnet in the registry is scanned.
+    """
     raw = wallet.get("networks")
     nets: List[str] = []
     if isinstance(raw, str) and raw.strip():
@@ -479,8 +638,38 @@ def _networks(wallet: Dict[str, Any]) -> List[str]:
             nets = [n.strip() for n in raw.split(",") if n.strip()]
     elif isinstance(raw, list):
         nets = [str(n) for n in raw]
-    nets = [n for n in nets if n in EVM_NETWORKS]
-    return nets or list(EVM_NETWORKS.keys())
+
+    resolved: List[str] = []
+    for name in nets:
+        key = resolve_network(name)
+        if key and key not in resolved:
+            resolved.append(key)
+    return resolved or evm_network_names(include_testnets=_include_testnets())
+
+
+async def warmup() -> None:
+    """
+    Open TLS connections to every configured RPC at boot. Without this the first
+    wallet scan pays 21 handshakes inside its per-request timeout budget.
+    """
+    async def ping(net: str) -> None:
+        try:
+            await _rpc_post(_http(), rpc_for(net), {
+                "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    await asyncio.gather(*[ping(n) for n in evm_network_names(include_testnets=True)])
+    logger.info("EVM RPC warmup complete (%d chains)", len(EVM_NETWORKS))
+
+
+async def _scan_chain(net: str, address: str) -> List[Dict[str, Any]]:
+    async with _chain_sem:
+        try:
+            return await asyncio.wait_for(scan_evm(net, address), timeout=SCAN_TIMEOUT)
+        except Exception as exc:                              # noqa: BLE001
+            logger.debug("scan_evm %s/%s failed: %s", net, address, exc)
+            return []
 
 
 async def scan_wallet(wallet: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -492,11 +681,12 @@ async def scan_wallet(wallet: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     if fam == "evm":
         batches = await asyncio.gather(
-            *[scan_evm(n, addr) for n in _networks(wallet)], return_exceptions=True)
+            *[_scan_chain(n, addr) for n in _networks(wallet)],
+            return_exceptions=True)
         flat: List[Dict[str, Any]] = []
-        for b in batches:
-            if isinstance(b, list):
-                flat.extend(b)
+        for batch in batches:
+            if isinstance(batch, list):
+                flat.extend(batch)
         return flat
     if fam == "solana":
         return await scan_solana(addr)
