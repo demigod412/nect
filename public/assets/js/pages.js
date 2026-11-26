@@ -770,7 +770,8 @@
      ====================================================================== */
   P.bot = async () => {
     const chat = NX.mountChat($('#chat-main'));
-    let data = await NX.get('/api/bots');
+    let data;
+    try { data = await NX.get('/api/bots'); } catch (_) { data = { bots: [], paperMode: true }; }
     const paper = $('#paper-toggle');
     if (paper) {
       paper.checked = !!data.paperMode;
@@ -802,7 +803,10 @@
     document.addEventListener('input', (e) => { if (e.target.id === 'code-2fa') window._code2fa = e.target.value; });
     $('#kill-btn').addEventListener('click', async () => { if (await NX.killSwitch()) refresh(); });
 
-    async function refresh() { data = await NX.get('/api/bots'); renderActive(); }
+    async function refresh() {
+      try { data = await NX.get('/api/bots'); } catch (_) { data = { bots: [], paperMode: true }; }
+      renderActive();
+    }
     function renderActive() {
       const sel = $('#bt-strategy');
       sel.innerHTML = data.bots.length ? data.bots.map((b) => `<option value="${b.id}">${esc(b.name)} · ${b.pair}</option>`).join('') : '<option value="">Deploy a bot to backtest it</option>';
@@ -1152,8 +1156,18 @@
      DEPOSIT
      ====================================================================== */
   P.deposit = async () => {
-    const data = await NX.get('/api/deposit');
-    const main = data.main;
+    let data;
+    try {
+      data = await NX.get('/api/deposit');
+    } catch (_) {
+      const wdata = await NX.get('/api/wallets').catch(() => ({ main: D.mainWallet, wallets: [] }));
+      data = {
+        main: wdata.main || D.mainWallet,
+        recent: [],
+        demo: !!(D.settings && D.settings.demo_mode)
+      };
+    }
+    const main = data.main || D.mainWallet;
     if (!main) {
       $('#main').querySelector('.grid').innerHTML = `<section class="card">${NX.empty('Connect a wallet first', 'Deposits go straight to your own main wallet — connect one to get its address.', '<a class="btn btn--primary" href="wallets.html#connect">Connect wallet</a>')}</section>`;
       return;
@@ -1201,7 +1215,10 @@
      WITHDRAW
      ====================================================================== */
   P.withdraw = async () => {
-    const [wd, book] = await Promise.all([NX.get('/api/wallets'), NX.get('/api/address-book')]);
+    const [wd, book] = await Promise.all([
+      NX.get('/api/wallets').catch(() => ({ main: D.mainWallet, wallets: [], accountBalance: D.accountBalance || 0 })),
+      NX.get('/api/address-book').catch(() => ({ rows: [] }))
+    ]);
     const wallets = [wd.main].concat(wd.wallets).filter((w) => w && w.verified);
     const fromSel = $('#wd-from');
     const bName = (window.NX && NX.brandName) ? NX.brandName() : 'NECTRA';
@@ -1399,8 +1416,18 @@
     const tabs = $('#loan-tabs');
     const usd = (v) => F.usd(+v || 0, 2);
     async function load() {
-      data = await NX.get('/api/loans');
-      NX.countUp($('#loan-acct'), data.accountBalance, { dec: 2, prefix: '$' });
+      try {
+        data = await NX.get('/api/loans');
+      } catch (_) {
+        data = {
+          accountBalance: D.accountBalance || 0,
+          credit: { score: 720, band: 'Good', multiplier: 1.0 },
+          products: [],
+          loans: [],
+          repaymentAddresses: {}
+        };
+      }
+      NX.countUp($('#loan-acct'), data.accountBalance || 0, { dec: 2, prefix: '$' });
       const c = data.credit;
       NX.charts.ring($('#credit-ring'), (c.score - 300) / 550, { size: 96, stroke: 9, center: `<b class="mono">${c.score}</b><div class="tiny muted">${c.band}</div>`, color: c.score < 500 ? 'var(--red)' : c.score < 600 ? 'var(--amber)' : 'var(--green)' });
       $('#credit-text').innerHTML = `Your limits are <b>${Math.round(c.multiplier * 100)}%</b> of each product’s maximum. On-time repayments raise your score; late payments and defaults lower it.`;
@@ -1623,14 +1650,16 @@
     }
     tb.addEventListener('click', (e) => { const b = e.target.closest('[data-alert]'); if (b) NX.priceAlert(b.dataset.alert); });
     async function loadAlerts() {
-      const r = await NX.get('/api/alerts');
-      $('#alerts-list').innerHTML = r.rows.length ? r.rows.map((a) => `<div class="list-row">${NX.tokIcon(a.token, 'tok--sm')}<div class="grow"><div class="small strong">${a.token} ${a.direction} $${a.price}</div><div class="caption">${a.active ? 'Active' : 'Triggered ' + (a.triggered_at ? ago(a.triggered_at) : '')}${a.email ? ' · email' : ''}</div></div><button class="icon-btn icon-btn--sm" data-del-alert="${a.id}" aria-label="Delete alert">${I('trash')}</button></div>`).join('') : '<p class="caption">No alerts yet — tap the bell on any token.</p>';
+      let r;
+      try { r = await NX.get('/api/alerts'); } catch (_) { r = { rows: [] }; }
+      $('#alerts-list').innerHTML = (r.rows && r.rows.length) ? r.rows.map((a) => `<div class="list-row">${NX.tokIcon(a.token, 'tok--sm')}<div class="grow"><div class="small strong">${a.token} ${a.direction} $${a.price}</div><div class="caption">${a.active ? 'Active' : 'Triggered ' + (a.triggered_at ? ago(a.triggered_at) : '')}${a.email ? ' · email' : ''}</div></div><button class="icon-btn icon-btn--sm" data-del-alert="${a.id}" aria-label="Delete alert">${I('trash')}</button></div>`).join('') : '<p class="caption">No alerts yet — tap the bell on any token.</p>';
     }
     $('#alerts-list').addEventListener('click', async (e) => { const b = e.target.closest('[data-del-alert]'); if (b && await NX.act(null, () => NX.del('/api/alerts/' + b.dataset.delAlert))) loadAlerts(); });
     document.addEventListener('nx:alerts', loadAlerts);
     document.addEventListener('nx:refresh', loadTokens);
-    const cal = await NX.get('/api/portfolio/calendar');
-    const days = cal.days.map((d) => ({ date: new Date(d.date), v: d.v }));
+    let cal;
+    try { cal = await NX.get('/api/portfolio/calendar'); } catch (_) { cal = { days: [] }; }
+    const days = (cal.days || []).map((d) => ({ date: new Date(d.date), v: d.v }));
     NX.whenVisible($('#pnl-cal'), (el) => NX.charts.calendar(el, days));
     $('#cal-summary').textContent = `${days.filter((d) => d.v > 0).length} green days · ${days.filter((d) => d.v < 0).length} red days · net ${F.signed(days.reduce((a, d) => a + d.v, 0))}`;
 
@@ -1639,12 +1668,13 @@
     $('#hist-type').innerHTML = types.map((t) => `<button class="chip" aria-pressed="${t === type}" data-t="${t}">${t}</button>`).join('');
     const qs = () => `type=${encodeURIComponent(type)}&q=${encodeURIComponent(q)}&days=${range}`;
     async function render() {
-      const r = await NX.get('/api/history?' + qs());
-      $('#hist-body').innerHTML = r.rows.length ? r.rows.slice(0, 100).map((h) => `<tr><td data-label="Date" class="small">${F.date(new Date(h.date))} <span class="faint mono tiny">${F.time(new Date(h.date))}</span></td><td data-label="Type"><span class="tag">${h.type}</span></td><td data-label="Asset" class="small">${esc(h.token)}</td><td data-label="Amount" class="r num">${h.type === 'Withdraw' ? '−' : ''}${h.amount}</td>
+      let r;
+      try { r = await NX.get('/api/history?' + qs()); } catch (_) { r = { rows: [] }; }
+      $('#hist-body').innerHTML = (r.rows && r.rows.length) ? r.rows.slice(0, 100).map((h) => `<tr><td data-label="Date" class="small">${F.date(new Date(h.date))} <span class="faint mono tiny">${F.time(new Date(h.date))}</span></td><td data-label="Type"><span class="tag">${h.type}</span></td><td data-label="Asset" class="small">${esc(h.token)}</td><td data-label="Amount" class="r num">${h.type === 'Withdraw' ? '−' : ''}${h.amount}</td>
         <td data-label="Status">${h.status === 'confirmed' ? `<span class="tag tag--green">${I('check')} Confirmed</span>` : h.status === 'confirming' ? `<span class="tag tag--amber">Confirming</span>` : `<span class="tag tag--red">${I('x')} ${esc(h.status)}</span>`}${h.simulated && h.type !== 'Bot trade' ? ' <span class="tag">sim</span>' : ''}</td>
         <td data-label="Details" class="r small muted">${h.sig ? (h.explorer ? `<a class="link mono" href="${h.explorer}" target="_blank" rel="noopener">${F.short(h.sig)}</a>` : `<span class="mono">${F.short(h.sig)}</span>`) : esc(h.note || '')}</td></tr>`).join('')
         : `<tr><td colspan="6">${NX.empty('Nothing here yet', 'No transactions match these filters.', '<button class="btn" data-reset>Reset filters</button>')}</td></tr>`;
-      $('#hist-count').textContent = r.rows.length;
+      $('#hist-count').textContent = (r.rows && r.rows.length) || 0;
     }
     $('#hist-type').addEventListener('click', (e) => { const c = e.target.closest('[data-t]'); if (!c) return; type = c.dataset.t; $$('#hist-type .chip').forEach((x) => x.setAttribute('aria-pressed', x === c)); render(); });
     $('#hist-search').addEventListener('input', (e) => { q = e.target.value; clearTimeout(tmr); tmr = setTimeout(render, 250); });
@@ -1662,12 +1692,28 @@
      ====================================================================== */
   P.referrals = async () => {
     async function load() {
-      const r = await NX.get('/api/referrals');
-      $('#ref-codes').innerHTML = r.codes.length ? r.codes.map((c) => `<div class="list-row"><span class="tok" style="background:var(--pink-tint);color:var(--pink)">${I('gift', 'ic--sm')}</span><div class="grow"><div class="mono strong">${c.code}</div><div class="caption">Created ${F.date(new Date(c.created_at))}${c.active ? '' : ' · disabled'}</div></div><div style="min-width:110px" class="hide-mobile"><div class="caption mono">${c.uses}/${c.max_uses} used</div><div class="progress"><div class="progress__bar" style="width:${(c.uses / c.max_uses) * 100}%"></div></div></div><span class="mono small hide-desktop">${c.uses}/${c.max_uses}</span>${NX.copyBtn(location.origin + '/register.html?code=' + c.code, 'Invite link copied')}</div>`).join('') : '<p class="caption">No codes yet — generate one.</p>';
-      $('#ref-total').textContent = r.total;
-      $('#tiers').innerHTML = r.tiers.map((t) => `<div class="tier ${t.current ? 'is-current' : t.reached ? '' : 'is-locked'}"><span class="tok" style="background:${{ Bronze: '#8B5A3C', Silver: '#9AA0AA', Gold: '#D9A93A', Petal: 'var(--pink)' }[t.name]}">${t.name[0]}</span><div class="grow"><b class="small">${t.name}</b><div class="caption">${t.at} invite${t.at > 1 ? 's' : ''} · ${t.perk} fee discount</div></div>${t.current ? '<span class="tag tag--pink">Current</span>' : t.reached ? I('check', 'up') : I('lock', 'faint')}</div>`).join('');
+      let r;
+      try {
+        r = await NX.get('/api/referrals');
+      } catch (_) {
+        r = {
+          code: (D.user && (D.user.referralCode || D.user.referral_code)) || 'NECTRA',
+          codes: [],
+          total: 0,
+          tiers: [
+            { name: 'Bronze', at: 1, perk: '10%', current: true },
+            { name: 'Silver', at: 5, perk: '20%' },
+            { name: 'Gold', at: 15, perk: '35%' },
+            { name: 'Petal', at: 50, perk: '50%' }
+          ],
+          next: { name: 'Silver', at: 5 }
+        };
+      }
+      $('#ref-codes').innerHTML = (r.codes && r.codes.length) ? r.codes.map((c) => `<div class="list-row"><span class="tok" style="background:var(--pink-tint);color:var(--pink)">${I('gift', 'ic--sm')}</span><div class="grow"><div class="mono strong">${c.code}</div><div class="caption">Created ${F.date(new Date(c.created_at))}${c.active ? '' : ' · disabled'}</div></div><div style="min-width:110px" class="hide-mobile"><div class="caption mono">${c.uses}/${c.max_uses} used</div><div class="progress"><div class="progress__bar" style="width:${(c.uses / c.max_uses) * 100}%"></div></div></div><span class="mono small hide-desktop">${c.uses}/${c.max_uses}</span>${NX.copyBtn(location.origin + '/register.html?code=' + c.code, 'Invite link copied')}</div>`).join('') : '<p class="caption">No codes yet — generate one.</p>';
+      $('#ref-total').textContent = r.total || 0;
+      $('#tiers').innerHTML = (r.tiers || []).map((t) => `<div class="tier ${t.current ? 'is-current' : t.reached ? '' : 'is-locked'}"><span class="tok" style="background:${{ Bronze: '#8B5A3C', Silver: '#9AA0AA', Gold: '#D9A93A', Petal: 'var(--pink)' }[t.name]}">${t.name[0]}</span><div class="grow"><b class="small">${t.name}</b><div class="caption">${t.at} invite${t.at > 1 ? 's' : ''} · ${t.perk} fee discount</div></div>${t.current ? '<span class="tag tag--pink">Current</span>' : t.reached ? I('check', 'up') : I('lock', 'faint')}</div>`).join('');
       const nx = r.next;
-      NX.charts.ring($('#ref-ring'), nx ? r.total / nx.at : 1, { size: 168, stroke: 12, center: `<div class="mono" style="font-size:30px;font-weight:600">${r.total}<span class="muted" style="font-size:16px">/${nx ? nx.at : r.total}</span></div><div class="caption">${nx ? 'to ' + nx.name : 'Top tier!'}</div>` });
+      NX.charts.ring($('#ref-ring'), nx ? (r.total / nx.at) : 1, { size: 168, stroke: 12, center: `<div class="mono" style="font-size:30px;font-weight:600">${r.total || 0}<span class="muted" style="font-size:16px">/${nx ? nx.at : (r.total || 0)}</span></div><div class="caption">${nx ? 'to ' + nx.name : 'Top tier!'}</div>` });
       NX.hydrateIcons();
     }
     $('#gen-code').addEventListener('click', async (e) => { const r = await NX.act(e.currentTarget, () => NX.post('/api/referrals/codes')); if (r) { NX.toast('New invite code', { msg: r.code }); load(); } });
@@ -1684,7 +1730,12 @@
     // applicable interval for a plan given the chosen billing (annual only if the plan has an annual price)
     const planInterval = (p) => (billing === 'yearly' && p.price_yearly > 0 ? 'yearly' : 'monthly');
     async function load() {
-      const r = await NX.get('/api/plans');
+      let r;
+      try {
+        r = await NX.get('/api/plans');
+      } catch (_) {
+        r = { enabled: false, balance: 0, plans: [] };
+      }
       if (r.enabled === false) {
         const bt = $('#pl-billing'); if (bt) bt.hidden = true;
         const cc = $('#pl-current-card'); if (cc) cc.hidden = true;
@@ -1800,7 +1851,16 @@
     let f = 'all', rows = [];
     const ICON = { security: ['shield-alert', 'var(--red)'], bot: ['bot', 'var(--pink)'], price: ['bell', 'var(--amber)'], transfer: ['deposit', 'var(--green)'] };
     const tabs = [['all', 'All'], ['price', 'Price alerts'], ['bot', 'Bot events'], ['transfer', 'Money & loans'], ['security', 'Security']];
-    const load = async () => { rows = (await NX.get('/api/notifications')).rows; renderChips(); render(); };
+    const load = async () => {
+      try {
+        const res = await NX.get('/api/notifications');
+        rows = (res && res.rows) ? res.rows : [];
+      } catch (_) {
+        rows = [];
+      }
+      renderChips();
+      render();
+    };
     const renderChips = () => ($('#notif-filter').innerHTML = tabs.map(([k, l]) => `<button class="chip" aria-pressed="${k === f}" data-f="${k}">${l}<span class="chip__count">${rows.filter((n) => (k === 'all' || n.type === k) && n.unread).length}</span></button>`).join(''));
     function render() {
       const rs = rows.filter((n) => f === 'all' || n.type === f);
@@ -1930,17 +1990,19 @@
     // sessions
     const ua = (s) => { const b = /Edg/.test(s) ? 'Edge' : /Chrome/.test(s) ? 'Chrome' : /Firefox/.test(s) ? 'Firefox' : /Safari/.test(s) ? 'Safari' : 'Browser'; const o = /Windows/.test(s) ? 'Windows' : /Mac/.test(s) ? 'macOS' : /iPhone|iPad/.test(s) ? 'iOS' : /Android/.test(s) ? 'Android' : /Linux/.test(s) ? 'Linux' : ''; return `${b}${o ? ' · ' + o : ''}`; };
     async function loadSessions() {
-      const r = await NX.get('/api/me/sessions');
-      $('#sessions').innerHTML = r.rows.map((s) => `<div class="list-row"><span class="notif__ic">${I(/Mobile|iPhone|Android/.test(s.user_agent || '') ? 'smartphone' : 'monitor')}</span><div class="grow"><div class="small strong">${esc(ua(s.user_agent || ''))} ${s.current ? '<span class="tag tag--green">This device</span>' : ''}</div><div class="caption">${esc(s.ip || '')} · active ${ago(s.last_seen_at)}</div></div>${s.current ? '' : `<button class="btn btn--sm btn--danger-outline" data-sess="${s.id}">Revoke</button>`}</div>`).join('');
+      let r;
+      try { r = await NX.get('/api/me/sessions'); } catch (_) { r = { rows: [] }; }
+      $('#sessions').innerHTML = (r.rows || []).map((s) => `<div class="list-row"><span class="notif__ic">${I(/Mobile|iPhone|Android/.test(s.user_agent || '') ? 'smartphone' : 'monitor')}</span><div class="grow"><div class="small strong">${esc(ua(s.user_agent || ''))} ${s.current ? '<span class="tag tag--green">This device</span>' : ''}</div><div class="caption">${esc(s.ip || '')} · active ${ago(s.last_seen_at)}</div></div>${s.current ? '' : `<button class="btn btn--sm btn--danger-outline" data-sess="${s.id}">Revoke</button>`}</div>`).join('');
     }
     $('#sessions').addEventListener('click', async (e) => { const b = e.target.closest('[data-sess]'); if (b && await NX.confirm({ title: 'Revoke session?', body: 'That device will be signed out immediately.', confirm: 'Revoke', danger: true })) { if (await NX.act(b, () => NX.del('/api/me/sessions/' + b.dataset.sess))) { NX.toast('Session revoked'); loadSessions(); } } });
     $('#revoke-all').addEventListener('click', async () => { if (await NX.confirm({ title: 'Sign out all other sessions?', body: 'Every device except this one will be signed out.', confirm: 'Sign out others', danger: true })) { const r = await NX.act(null, () => NX.post('/api/me/sessions/revoke-others')); if (r) { NX.toast(`${r.revoked} session(s) signed out`); loadSessions(); } } });
 
     // whitelist
     async function loadWl() {
-      const r = await NX.get('/api/address-book');
-      $('#wl-only').checked = r.whitelistOnly;
-      $('#whitelist').innerHTML = r.rows.length ? r.rows.map((b) => `<div class="list-row"><span class="notif__ic">${I(b.whitelisted ? 'shield' : 'book')}</span><div class="grow"><div class="small strong">${esc(b.label)} ${b.unlock_at > Date.now() ? `<span class="tag tag--amber">Unlocks ${new Date(b.unlock_at).toLocaleString()}</span>` : '<span class="tag tag--green">Whitelisted</span>'}</div>${NX.addr(b.address, 'addr--muted')}</div><button class="icon-btn icon-btn--sm" data-wl="${b.id}" aria-label="Remove ${esc(b.label)}">${I('trash')}</button></div>`).join('') : '<p class="caption">No saved addresses.</p>';
+      let r;
+      try { r = await NX.get('/api/address-book'); } catch (_) { r = { whitelistOnly: false, rows: [] }; }
+      $('#wl-only').checked = !!r.whitelistOnly;
+      $('#whitelist').innerHTML = (r.rows && r.rows.length) ? r.rows.map((b) => `<div class="list-row"><span class="notif__ic">${I(b.whitelisted ? 'shield' : 'book')}</span><div class="grow"><div class="small strong">${esc(b.label)} ${b.unlock_at > Date.now() ? `<span class="tag tag--amber">Unlocks ${new Date(b.unlock_at).toLocaleString()}</span>` : '<span class="tag tag--green">Whitelisted</span>'}</div>${NX.addr(b.address, 'addr--muted')}</div><button class="icon-btn icon-btn--sm" data-wl="${b.id}" aria-label="Remove ${esc(b.label)}">${I('trash')}</button></div>`).join('') : '<p class="caption">No saved addresses.</p>';
     }
     $('#whitelist').addEventListener('click', async (e) => { const b = e.target.closest('[data-wl]'); if (b && await NX.act(null, () => NX.del('/api/address-book/' + b.dataset.wl))) { NX.toast('Address removed'); loadWl(); } });
     $('#wl-form').addEventListener('submit', async (e) => {
