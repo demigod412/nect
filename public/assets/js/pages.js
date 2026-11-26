@@ -31,7 +31,11 @@
   const skeleton = (el, rows = 4, cls = 'skel--row') => { el.innerHTML = Array.from({ length: rows }, () => `<div class="skel ${cls}"></div>`).join(''); };
   const fee = (txt = '~0.000005 SOL', usd = '') => `<span class="fee-chip">${I('fuel')} Network fee <b>${txt}</b> <span class="faint">${usd}</span></span>`;
   const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-  const nextUrl = () => { const n = new URLSearchParams(location.search).get('next'); if (n === 'admin') return '/admin'; return n && /^[\w-]+\.html/.test(n) ? n : 'dashboard.html'; };
+  const nextUrl = (isStaff) => {
+    const n = new URLSearchParams(location.search).get('next');
+    if (n === 'admin' || (n && n.startsWith('admin'))) return isStaff ? '/admin' : 'dashboard.html';
+    return n && /^[\w-]+\.html/.test(n) ? n : (isStaff ? '/admin' : 'dashboard.html');
+  };
   const go = (h) => NX.navigate(h);
 
   /* ---------- wallet picker sheet (connect / prove ownership) ---------- */
@@ -518,15 +522,21 @@
      LOGIN (+2FA, forgot / reset password, wallet sign-in)
      ====================================================================== */
   P.login = async () => {
-    try { const me = await NX.get('/api/auth/me'); if (me.user && !me.pending2fa && !me.needsVerification) { go(nextUrl()); return; } } catch (e) { /* not signed in */ }
-    document.addEventListener('click', (e) => { const g = e.target.closest('[data-goto]'); if (g) { e.preventDefault(); showStep('step-' + g.dataset.goto, g.dataset.back != null); } });
     const STAFF = ['admin', 'super_admin', 'loan_officer', 'compliance'];
+    try {
+      const me = await NX.get('/api/auth/me');
+      if (me.user && !me.pending2fa && !me.needsVerification) {
+        const isStaff = STAFF.includes(me.user.role) || me.user.staff;
+        go(nextUrl(isStaff));
+        return;
+      }
+    } catch (e) { /* not signed in */ }
+    document.addEventListener('click', (e) => { const g = e.target.closest('[data-goto]'); if (g) { e.preventDefault(); showStep('step-' + g.dataset.goto, g.dataset.back != null); } });
     const done = (r) => {
       if (r.twoFA || r.twofaRequired) { showStep('step-2fa'); tfa.focus(); return; }
       if (r.needsVerification) { NX.devHint(r); go('register.html#verify'); return; }
-      const staff = r.user && STAFF.includes(r.user.role);
-      const hasNext = !!new URLSearchParams(location.search).get('next');
-      go(staff && !hasNext ? '/admin' : nextUrl());
+      const staff = r.user && (STAFF.includes(r.user.role) || r.user.staff);
+      go(nextUrl(staff));
     };
     $('#login-form').addEventListener('submit', async (e) => {
       e.preventDefault();

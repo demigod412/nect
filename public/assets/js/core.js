@@ -825,7 +825,11 @@
     NX.toast(`${r.paused} bot${r.paused === 1 ? '' : 's'} paused`, { type: 'warn', msg: 'No new orders will be placed.' });
     return true;
   };
-  NX.logout = async () => { try { await NX.post('/api/auth/logout'); } catch (e) { /* ignore */ } location.href = '/login.html'; };
+  NX.logout = async () => {
+    try { await NX.post('/api/auth/logout'); } catch (e) { /* ignore */ }
+    const isAdmin = document.body && document.body.classList.contains('admin');
+    location.href = isAdmin ? '/admin/login.html' : '/login.html';
+  };
 
   /* ---------- SWAP quick action (paper account) ---------- */
   function openSwap() {

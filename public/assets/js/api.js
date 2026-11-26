@@ -47,8 +47,12 @@
       const err = new Error(j.error || detail || `Request failed (${r.status})`);
       err.status = r.status; err.data = j;
       const app = document.body && document.body.classList.contains('app');
-      if (r.status === 401 && app) location.href = 'login.html?next=' + encodeURIComponent(location.pathname.replace(/^\//, '') + location.search + location.hash);
-      if (j.code === 'EMAIL_UNVERIFIED' && app) location.href = 'register.html#verify';
+      const admin = document.body && document.body.classList.contains('admin');
+      if (r.status === 401) {
+        if (admin) { location.href = '/admin/login.html'; }
+        else if (app) { location.href = '/login.html?next=' + encodeURIComponent(location.pathname.replace(/^\//, '') + location.search + location.hash); }
+      }
+      if (j.code === 'EMAIL_UNVERIFIED' && (app || admin)) location.href = '/register.html#verify';
       throw err;
     }
     return j;

@@ -501,15 +501,6 @@
           });
         }
       }
-                });
-                if (go2fa && NX.openAdmin2FAModal) NX.openAdmin2FAModal();
-              } else {
-                NX.toast(err.message, { type: 'error' });
-              }
-            }
-          });
-        }
-      }
       if (a === 'status' && await NX.confirm({ title: u.status === 'active' ? 'Suspend this account?' : 'Reactivate this account?', body: u.status === 'active' ? 'They are signed out everywhere and their bots are paused.' : 'They can sign in again.', confirm: u.status === 'active' ? 'Suspend' : 'Reactivate', danger: u.status === 'active' })) act(b, () => NX.patch('/api/admin/users/' + u.id, { status: u.status === 'active' ? 'suspended' : 'active' }), 'User updated');
       if (a === 'role') { const v = await formDialog({ title: 'Change role', intro: 'Loan officers review and recommend. Admins approve, disburse and run operations. Super admins also manage settings, roles, products and balance adjustments.', fields: [{ name: 'role', label: 'Role', type: 'select', value: u.role, options: [['user', 'User (no staff access)'], ['loan_officer', 'Loan officer'], ['admin', 'Admin'], ['super_admin', 'Super admin']] }], confirm: 'Save role', danger: true }); if (v) act(b, () => NX.patch('/api/admin/users/' + u.id, { role: v.role }), 'Role updated'); }
       if (a === 'pause') act(b, () => NX.post(`/api/admin/users/${u.id}/pause-bots`), 'Bots paused');
@@ -1230,7 +1221,7 @@
   NX.pages = { admin: async () => {
     let me;
     try { me = await NX.get('/api/auth/me'); } catch (e) { me = {}; }
-    if (!me.user || me.pending2fa) { location.href = '/login.html?next=admin'; return; }
+    if (!me.user || me.pending2fa) { location.href = '/admin/login.html'; return; }
     if (me.needsVerification) { location.href = '/register.html#verify'; return; }
     if (!me.user.staff) { document.body.innerHTML = `<div class="auth"><main class="auth__main"><section class="card auth__card center"><h1 class="auth__title">Admins only</h1><p class="auth__lead">Your account doesn’t have admin access.</p><a class="btn btn--primary" href="/dashboard.html">Back to the app</a></section></main></div>`; return; }
     NX.data.user = me.user;

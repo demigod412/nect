@@ -52,6 +52,9 @@ class AuthFlowTests(unittest.TestCase):
     def post(self, path, body=None):
         return self.client.post(path, json=body or {}, headers={"X-CSRF": self.csrf()})
 
+    def patch(self, path, body=None):
+        return self.client.patch(path, json=body or {}, headers={"X-CSRF": self.csrf()})
+
     # ---- registration + verification -------------------------------------
     def test_register_requires_verified_email(self):
         database.update_setting("invite_only", False)
@@ -123,6 +126,7 @@ class AuthFlowTests(unittest.TestCase):
         r = self.client.get("/api/admin/overview")
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json().get("code"), "ADMIN_2FA_REQUIRED")
+        database.update_setting("admin_2fa_required", False)
 
     # ---- invites ---------------------------------------------------------
     def test_invite_only(self):
@@ -141,6 +145,125 @@ class AuthFlowTests(unittest.TestCase):
         self.assertEqual(self.post("/api/auth/invite/validate",
                                    {"code": "GOOD1234"}).status_code, 400)
         database.update_setting("invite_only", False)
+
+
+    # ---- duplicate registration & password hashing ----------------------
+    def test_duplicate_registration_rejected(self):
+        database.update_setting("registration_open", True)
+        database.update_setting("invite_only", False)
+        email = "dup_test@example.com"
+        r1 = self.post("/api/auth/register", {
+            "email": email, "password": PASSWORD, "acceptTerms": True})
+        self.assertEqual(r1.status_code, 200)
+
+        # Duplicate attempt must be rejected
+        r2 = self.post("/api/auth/register", {
+            "email": email, "password": PASSWORD, "acceptTerms": True})
+        self.assertEqual(r2.status_code, 409)
+        self.assertIn("already registered", r2.text.lower())
+
+    def test_password_hashing_security(self):
+        email = "hash_test@example.com"
+        self.post("/api/auth/register", {
+            "email": email, "password": PASSWORD, "acceptTerms": True})
+        user = database.q_get("SELECT pw_hash, password_hash FROM users WHERE email = ?", email)
+        self.assertIsNotNone(user)
+        pw_hash = user.get("pw_hash") or user.get("password_hash")
+        self.assertTrue(pw_hash.startswith("scrypt$"), "Password must be scrypt-hashed")
+        self.assertNotIn(PASSWORD, str(user.values()), "Plaintext password must never be stored")
+
+    def _create_user(self, email, password=PASSWORD, role="trader", status="active", verified=True):
+        import security as S
+        h = S.hash_password(password)
+        database.q_run("INSERT INTO users (email, pw_hash, password_hash, name, role, status,"
+                       " email_verified, paper_mode, created_at)"
+                       " VALUES (?, ?, ?, 'Test User', ?, ?, ?, 1, ?)",
+                       email, h, h, role, status, 1 if verified else 0, database.now())
+
+    # ---- login credentials & session management --------------------------
+    def test_login_invalid_credentials(self):
+        email = "cred_test@example.com"
+        self._create_user(email, PASSWORD)
+
+        # Wrong password
+        bad_pw = self.post("/api/auth/login", {
+            "email": email, "password": "WrongPassword99!"})
+        self.assertEqual(bad_pw.status_code, 401)
+        self.assertIn("invalid email or password", bad_pw.text.lower())
+
+        # Non-existent email
+        bad_email = self.post("/api/auth/login", {
+            "email": "nonexistent_999@example.com", "password": PASSWORD})
+        self.assertEqual(bad_email.status_code, 401)
+        self.assertIn("invalid email or password", bad_email.text.lower())
+
+    def test_logout_and_session_persistence(self):
+        email = "session_test@example.com"
+        self._create_user(email, PASSWORD)
+
+        # Log in
+        login = self.post("/api/auth/login", {
+            "email": email, "password": PASSWORD})
+        self.assertEqual(login.status_code, 200)
+
+        # Session persistence across requests
+        me1 = self.client.get("/api/auth/me")
+        self.assertEqual(me1.status_code, 200)
+        self.assertEqual(me1.json()["user"]["email"], email)
+
+        me2 = self.client.get("/api/auth/me")
+        self.assertEqual(me2.status_code, 200)
+
+        # Logout
+        logout = self.post("/api/auth/logout")
+        self.assertEqual(logout.status_code, 200)
+
+        # After logout, protected routes must refuse access
+        me_after = self.client.get("/api/auth/me")
+        self.assertEqual(me_after.status_code, 401)
+        self.assertEqual(self.client.get("/api/dashboard").status_code, 401)
+
+    # ---- authorization: non-admin vs administrator -----------------------
+    def test_non_admin_cannot_access_admin_portal(self):
+        email = "regular_trader@example.com"
+        self._create_user(email, PASSWORD)
+
+        # Regular user logged in
+        self.post("/api/auth/login", {"email": email, "password": PASSWORD})
+
+        # Regular user must be blocked from all admin endpoints
+        for endpoint in ["/api/admin/overview", "/api/admin/settings", "/api/admin/users", "/api/admin/invites"]:
+            res = self.client.get(endpoint)
+            self.assertEqual(res.status_code, 403, f"{endpoint} should return 403 for regular user")
+            self.assertIn("missing permission", res.text.lower())
+
+    # ---- admin management settings & roles --------------------------------
+    def test_admin_settings_view_update_permissions(self):
+        # Super admin can view and update settings
+        self.post("/api/auth/login", {
+            "email": "admin@nectra.local", "password": "Adm1n!Test2026"})
+        
+        settings_res = self.client.get("/api/admin/settings")
+        self.assertEqual(settings_res.status_code, 200)
+        self.assertIn("settings", settings_res.json())
+
+        # Update platform setting
+        patch_res = self.patch("/api/admin/settings", {"platform_name": "NECTRA Verified"})
+        self.assertEqual(patch_res.status_code, 200)
+        self.assertEqual(patch_res.json()["applied"].get("platform_name"), "NECTRA Verified")
+
+        # Verify setting persisted
+        settings_after = self.client.get("/api/admin/settings")
+        self.assertEqual(settings_after.json()["settings"]["platform_name"], "NECTRA Verified")
+
+        # Revert platform_name
+        self.patch("/api/admin/settings", {"platform_name": "NECTRA"})
+
+        # Restricted management action: non-super-admin staff cannot patch settings
+        self._create_user("officer_test@nectra.local", PASSWORD, role="loan_officer")
+        self.post("/api/auth/login", {"email": "officer_test@nectra.local", "password": PASSWORD})
+        forbidden_patch = self.patch("/api/admin/settings", {"platform_name": "HACKED"})
+        self.assertEqual(forbidden_patch.status_code, 403)
 
 
 if __name__ == "__main__":

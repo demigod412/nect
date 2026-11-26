@@ -197,7 +197,10 @@ async function api(url, options = {}) {
   let body = null;
   try { body = await res.json(); } catch { /* empty */ }
 
-  if (res.status === 401) throw new Error("Not signed in — open /login.html");
+  if (res.status === 401) {
+    location.href = '/admin/login.html';
+    throw new Error("Not signed in — redirecting to admin login...");
+  }
   if (res.status === 403) throw new Error(body?.detail || "Missing permission for this action");
   if (!res.ok) {
     const d = body?.detail;
