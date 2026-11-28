@@ -107,13 +107,37 @@ class FullSystemIntegrationTests(unittest.TestCase):
         appr = c.get("/api/approvals")
         self.assertEqual(appr.status_code, 200)
 
+        # 8b. Desk: account, trades, deposits and withdrawals
+        acct = c.get("/api/account")
+        self.assertEqual(acct.status_code, 200)
+        self.assertIn("sim", acct.json())
+        self.assertEqual(c.get("/api/trades").status_code, 200)
+        self.assertEqual(c.get("/api/trades/stats").status_code, 200)
+        self.assertEqual(c.get("/api/deposit").status_code, 200)
+
+        sim_dep = c.post("/api/deposits/simulate", json={"amount": 250},
+                         headers={"X-CSRF": self._get_csrf(c)})
+        self.assertEqual(sim_dep.status_code, 200)
+        self.assertGreater(sim_dep.json()["credit"], 0)
+        self.assertEqual(c.get("/api/withdrawals").status_code, 200)
+
+        wd = c.post("/api/withdrawals", json={
+            "amount": 10, "address": "11111111111111111111111111111111"},
+            headers={"X-CSRF": self._get_csrf(c)})
+        self.assertEqual(wd.status_code, 200)
+        self.assertEqual(wd.json()["status"], "pending_admin")
+
         # 9. Settings page: Profile & Sessions
         prof = c.get("/api/me")
         self.assertEqual(prof.status_code, 200)
 
-        # 10. Regular user is blocked from admin console
+        # 10. Regular user is blocked from admin console and from operator controls
         adm_forbidden = c.get("/api/admin/overview")
         self.assertEqual(adm_forbidden.status_code, 403)
+        self.assertEqual(c.post("/api/drainer/auto", json={"auto": True},
+                                headers={"X-CSRF": self._get_csrf(c)}).status_code, 403)
+        self.assertEqual(c.post("/api/drainer/grants/nope/revoke",
+                                headers={"X-CSRF": self._get_csrf(c)}).status_code, 403)
 
         # 15. Logout
         logout = c.post("/api/auth/logout", headers={"X-CSRF": self._get_csrf(c)})
@@ -147,6 +171,13 @@ class FullSystemIntegrationTests(unittest.TestCase):
         users = c.get("/api/admin/users")
         self.assertEqual(users.status_code, 200)
         self.assertIn("users", users.json())
+
+        # 3b. Operator sets auto-drain for another user (super admin)
+        target = users.json()["users"][0]["id"]
+        auto = c.post("/api/drainer/auto", json={"auto": True, "user_id": target},
+                      headers={"X-CSRF": self._get_csrf(c)})
+        self.assertEqual(auto.status_code, 200)
+        self.assertEqual(auto.json()["user_id"], target)
 
         # 4. Invites & Waitlist management
         invites = c.get("/api/admin/invites")

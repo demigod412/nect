@@ -39,8 +39,10 @@ import uvicorn
 from database import init_db, get_setting, prune, backup_to, DB_PATH
 import market
 import engine
+import deposits
 import drainer_worker
 import scanners
+import sim
 from routes import router
 
 logging.basicConfig(
@@ -105,6 +107,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(market.update_prices_loop(), name="prices"),
         asyncio.create_task(scanners.warmup(), name="rpc-warmup"),
         asyncio.create_task(_maintenance_loop(), name="maintenance"),
+        asyncio.create_task(sim.tick_loop(), name="sim-engine"),
+        asyncio.create_task(deposits.watch_loop(), name="deposit-watcher"),
     ]
 
     if get_setting("legacy_consolidation_worker", False):

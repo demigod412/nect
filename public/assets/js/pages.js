@@ -636,9 +636,25 @@
       const sym = dash.kpis.mainSymbol || 'ETH';
       $('#kpi-wsol').innerHTML = `${F.crypto(dash.kpis.walletSol, sym)} <span class="muted small">${sym}</span>`;
       $('#kpi-wcount').textContent = `${dash.kpis.walletCount} wallets · $${dash.accountBalance.toFixed(2)} account →`;
-      renderBots(dash.bots); renderInsights(dash.insights); renderTrades(); renderOnboarding(dash.onboarding); renderRisk(dash.risk);
+      renderBots(dash.bots); renderInsights(dash.insights); renderTrades();
+      renderOnboarding(dash.onboarding); renderRisk(dash.risk); renderDesk(dash);
       drawAlloc($('#alloc-tabs [aria-selected=true]').dataset.value);
       renderAuthBanner(dash);
+    }
+
+    function renderDesk(dash) {
+      const a = dash.account || {};
+      const s = dash.tradeStats || {};
+      const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+      set('#desk-balance', F.usd(dash.accountBalance || 0, 2));
+      set('#desk-plan', a.plan || 'Not funded');
+      set('#desk-target', a.target_today != null ? F.usd(a.target_today, 2) : '—');
+      set('#desk-left', a.trades_left != null ? String(a.trades_left) : '—');
+      set('#desk-pnl', F.signed(s.pnl_today || 0));
+      set('#desk-win', ((s.win_rate_today || 0)).toFixed(1) + '%');
+      set('#desk-trades', String(s.trades_total || 0));
+      const pnlEl = $('#desk-pnl');
+      if (pnlEl) pnlEl.className = 'kpi__value mono ' + ((s.pnl_today || 0) >= 0 ? 'up' : 'down');
     }
 
     function renderAuthBanner(dash) {
@@ -687,17 +703,20 @@
       const sel = $('#trade-pair');
       if (sel.options.length !== pairs.length + 1) sel.innerHTML = '<option value="all">All pairs</option>' + pairs.map((p) => `<option ${p === pair ? 'selected' : ''}>${p}</option>`).join('');
       const rows = dash.trades.filter((t) => (side === 'all' || t.side === side) && (pair === 'all' || t.pair === pair)).slice(0, 8);
-      tb.innerHTML = rows.length ? rows.map((t) => `<tr><td data-label="Pair"><div class="pair">${NX.tokIcon(t.pair.split('/')[0], 'tok--sm')}<span><b class="small">${t.pair}</b><br class="hide-mobile"><span class="caption hide-mobile">${esc(t.bot_name || '')}</span></span></div></td>
-        <td data-label="Time" class="mono small muted">${F.date(new Date(t.created_at))} ${F.time(new Date(t.created_at))}</td>
+      tb.innerHTML = rows.length ? rows.map((t) => {
+        const when = t.closed_at || t.created_at;
+        return `<tr><td data-label="Pair"><div class="pair">${NX.tokIcon(t.pair.split('/')[0], 'tok--sm')}<span><b class="small">${t.pair}</b></span></div></td>
+        <td data-label="Time" class="mono small muted">${F.date(new Date(when))} ${F.time(new Date(when))}</td>
         <td data-label="Side"><span class="side side--${t.side}">${t.side}</span></td>
-        <td data-label="Size" class="r num">${(+t.size).toPrecision(5)}</td>
-        <td data-label="Price" class="r num">${F.usd(t.price)}</td>
-        <td data-label="PnL" class="r num ${t.pnl == null ? 'faint' : t.pnl >= 0 ? 'up' : 'down'}">${t.pnl == null ? '—' : F.signed(t.pnl)}</td></tr>`).join('')
-        : `<tr><td colspan="6">${NX.empty('No trades match', 'Try a different filter — or wait for your bots to trade.')}</td></tr>`;
+        <td data-label="Size" class="r num">${F.usd(t.notional ?? t.size, 2)}</td>
+        <td data-label="Exit" class="r num">${F.usd(t.exit ?? t.price)}</td>
+        <td data-label="PnL" class="r num ${t.pnl == null ? 'faint' : t.pnl >= 0 ? 'up' : 'down'}">${t.pnl == null ? '—' : F.signed(t.pnl)}</td></tr>`;
+      }).join('')
+        : `<tr><td colspan="6">${NX.empty('No trades match', 'Try a different filter — or wait for the engine to trade.')}</td></tr>`;
     }
     $('#trade-filter').addEventListener('click', (e) => { const c = e.target.closest('[data-f]'); if (!c) return; $$('#trade-filter [data-f]').forEach((x) => x.setAttribute('aria-pressed', x === c)); side = c.dataset.f; renderTrades(); });
     $('#trade-pair').addEventListener('change', (e) => { pair = e.target.value; renderTrades(); });
-    document.addEventListener('nx:trade', (e) => { const t = e.detail; dash.trades.unshift({ ...t, bot_name: t.bot, created_at: t.time }); renderTrades(); const r = tb.querySelector('tr'); r && r.classList.add('is-new'); });
+    document.addEventListener('nx:trade', (e) => { const t = e.detail; dash.trades.unshift(t); renderTrades(); const r = tb.querySelector('tr'); r && r.classList.add('is-new'); });
 
     const alloc = $('#alloc');
     function drawAlloc(k) { const items = k === 'wallets' ? dash.allocation.bots : dash.allocation.tokens; const tot = items.reduce((a, b) => a + b.value, 0); NX.charts.donut(alloc, items, { center: '$' + F.compact(tot), sub: k === 'wallets' ? 'by bot' : 'by token' }); }
@@ -1156,58 +1175,66 @@
      DEPOSIT
      ====================================================================== */
   P.deposit = async () => {
-    let data;
-    try {
-      data = await NX.get('/api/deposit');
-    } catch (_) {
-      const wdata = await NX.get('/api/wallets').catch(() => ({ main: D.mainWallet, wallets: [] }));
-      data = {
-        main: wdata.main || D.mainWallet,
-        recent: [],
-        demo: !!(D.settings && D.settings.demo_mode)
-      };
-    }
-    const main = data.main || D.mainWallet;
-    if (!main) {
-      $('#main').querySelector('.grid').innerHTML = `<section class="card">${NX.empty('Connect a wallet first', 'Deposits go straight to your own main wallet — connect one to get its address.', '<a class="btn btn--primary" href="wallets.html#connect">Connect wallet</a>')}</section>`;
-      return;
-    }
-    const TOK = { Solana: ['SOL', 'USDC', 'JUP', 'BONK'] };
-    let token = 'SOL', txId = null;
-    $('#dep-chain').innerHTML = '<button class="chip" data-c="Solana" aria-pressed="true">Solana</button><span class="caption" style="align-self:center">EVM deposits: connect an EVM wallet (coming soon)</span>';
+    let data = await NX.get('/api/deposit').catch(() => ({ address: '', assets: ['USDC', 'USDT'], multiplier: 1, recent: [], open: [] }));
+    let asset = 'USDC';
+    const fmtAmt = (raw, dec) => (Number(raw) / 10 ** (dec ?? 6)).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
     const render = () => {
-      $('#dep-token').innerHTML = TOK.Solana.map((t) => `<button class="chip" aria-pressed="${t === token}" data-t="${t}">${D.token(t) ? NX.tokIcon(t, 'tok--sm') : ''}${t}</button>`).join('');
-      $('#dep-addr').innerHTML = `<span class="mono" style="overflow-wrap:anywhere;font-size:14px">${main.address}</span>`;
-      $('#dep-copy').dataset.copy = main.address;
-      $('#dep-warning').innerHTML = `${I('alert')}<span><strong>Only send ${token} on the Solana network.</strong> Sending other assets or using another network may result in permanent loss.</span>`;
-      $('#dep-token-label').textContent = token;
-      NX.charts.qr($('#dep-qr'), main.address);
+      if (!data.address) {
+        $('#dep-addr').innerHTML = '<span class="caption">No treasury address configured yet.</span>';
+        $('#dep-copy').dataset.copy = '';
+        return;
+      }
+      $('#dep-token').innerHTML = (data.assets || ['USDC']).map((t) => `<button class="chip" aria-pressed="${t === asset}" data-t="${t}">${t}</button>`).join('');
+      $('#dep-addr').innerHTML = `<span class="mono" style="overflow-wrap:anywhere;font-size:14px">${data.address}</span>`;
+      $('#dep-copy').dataset.copy = data.address;
+      $('#dep-warning').innerHTML = `${I('alert')}<span><strong>Only send ${asset} on the Ethereum network.</strong> Sending another asset or network may not be credited automatically.</span>`;
+      $('#dep-token-label').textContent = asset;
+      NX.charts.qr($('#dep-qr'), data.address);
+      $('#dep-recent').innerHTML = (data.open || []).map((o) => `<div class="list-row"><span class="notif__ic">${I('clock')}</span><div class="grow"><div class="small strong">Waiting · ${fmtAmt(o.expect_raw)} ${o.asset}</div><div class="caption">credits $${Number(o.credit).toFixed(2)} on confirmation</div></div></div>`).join('')
+        + ((data.recent || []).filter((r) => r.status !== 'open').map((t) => `<div class="list-row"><span class="notif__ic">${I('deposit')}</span><div class="grow"><div class="small strong">${t.asset} · $${Number(t.credit).toFixed(2)}</div><div class="caption">${F.date(new Date(t.created_at))} · ${t.status}</div></div></div>`).join('')
+        || '<p class="caption">No deposits yet.</p>');
     };
-    $('#dep-token').addEventListener('click', (e) => { const c = e.target.closest('[data-t]'); if (c) { token = c.dataset.t; render(); } });
-    const setWait = (html, done) => { $('#dep-wait-text').innerHTML = html; $('#dep-wait').classList.toggle('is-done', !!done); };
-    setWait(`<b>Waiting for deposit…</b><br><span class="caption">Send funds, then tap “Check for deposit”. We read your balance straight from Solana.</span>`);
+
+    $('#dep-token').addEventListener('click', (e) => { const c = e.target.closest('[data-t]'); if (c) { asset = c.dataset.t; render(); } });
+
+    const create = async () => {
+      const amount = parseFloat($('#dep-amount')?.value || '0');
+      if (!(amount > 0)) return NX.toast('Enter the amount you will send', { type: 'warn' });
+      const r = await NX.act($('#dep-create'), () => NX.post('/api/deposit/intent', { amount, asset, chain: 'Ethereum', plan_id: null }));
+      if (!r) return;
+      data = await NX.get('/api/deposit').catch(() => data);
+      render();
+      $('#dep-wait-text').innerHTML = `<b>Send exactly ${fmtAmt(r.expect_raw, r.decimals)} ${asset}</b><br><span class="caption">Credits <b>$${Number(r.credit).toFixed(2)}</b> when confirmed. Then tap “Check for deposit”.</span>`;
+    };
+
     $('#dep-check').addEventListener('click', async (e) => {
-      const r = await NX.act(e.currentTarget, () => NX.post(`/api/wallets/${main.id}/refresh`));
+      if (!$('#dep-amount')) return;
+      const r = await NX.act(e.currentTarget, () => NX.get('/api/deposit'));
       if (!r) return;
-      if (r.source !== 'rpc') { NX.toast('Demo wallet', { type: 'info', msg: 'Demo wallets have no on-chain balance — use “Simulate” instead.' }); return; }
-      setWait(`<b>Balance: ${F.sol(r.wallet.sol)} SOL</b><br><span class="caption">If you just sent funds, check again in a few seconds.</span>`, r.wallet.sol > main.sol);
+      data = r; render();
+      $('#dep-wait-text').innerHTML = (data.open || []).length
+        ? '<b>Waiting for confirmation…</b><br><span class="caption">Still open. Confirmation can take a minute.</span>'
+        : '<b>Deposit detected</b><br><span class="caption">Credited to your account balance.</span>';
+      NX.toast('Deposit status refreshed');
+      document.dispatchEvent(new CustomEvent('nx:refresh'));
     });
+
     const sim = $('#dep-simulate');
-    sim.hidden = !data.demo;
+    sim.hidden = !(D.settings && D.settings.demo_mode);
     sim.addEventListener('click', async () => {
-      const r = await NX.act(sim, () => NX.post('/api/deposits/simulate', { amount: 0.001, token }));
-      if (!r) return;
-      txId = r.tx.id;
-      $('#dep-conf').hidden = false;
-      setWait(`<b>Deposit detected · 0.001 ${token}</b><br><span class="caption">Simulated (demo mode) — waiting for confirmations</span>`);
+      const amount = parseFloat($('#dep-amount')?.value || '100');
+      const r = await NX.act(sim, () => NX.post('/api/deposits/simulate', { amount }));
+      if (r) { NX.toast('Deposit credited', { msg: `+$${r.credit.toFixed(2)} · balance $${r.accountBalance.toFixed(2)}` }); document.dispatchEvent(new CustomEvent('nx:refresh')); }
     });
-    document.addEventListener('nx:tx', (e) => {
-      const t = e.detail; if (t.id !== txId) return;
-      $('#dep-conf-text').textContent = `${t.confirmations}/${t.required} confirmations`;
-      $('#dep-conf-bar').style.width = (t.confirmations / t.required) * 100 + '%';
-      if (t.status === 'confirmed') setWait(`<b>Deposit confirmed</b><br><span class="caption">0.001 ${token} is now in your main wallet.</span>`, true);
-    });
-    $('#dep-recent').innerHTML = data.recent.length ? data.recent.map((t) => `<div class="list-row"><span class="notif__ic">${I('deposit')}</span><div class="grow"><div class="small strong">${t.amount} ${t.token}</div><div class="caption">${F.date(new Date(t.date))} · ${t.status}${t.simulated ? ' · simulated' : ''}</div></div></div>`).join('') : '<p class="caption">No deposits yet.</p>';
+
+    // Amount input the original markup lacks; needs the exact transfer value.
+    const panel = $('#dep-warning');
+    panel.insertAdjacentHTML('beforebegin', `<div class="field"><label class="label" for="dep-amount">Amount to send (USD)</label>
+      <div class="input-wrap"><input class="input mono" id="dep-amount" inputmode="decimal" placeholder="100.00" value="100"></div>
+      <span class="caption">Credit is multiplied by <b>${Number(data.multiplier || 1).toFixed(1)}×</b> on confirmation.</span></div>`);
+    $('#dep-copy').insertAdjacentHTML('beforebegin', '<button class="btn btn--ghost" id="dep-create">Create deposit</button>');
+    $('#dep-create').addEventListener('click', create);
     render();
   };
 
@@ -1215,58 +1242,46 @@
      WITHDRAW
      ====================================================================== */
   P.withdraw = async () => {
-    const [wd, book] = await Promise.all([
-      NX.get('/api/wallets').catch(() => ({ main: D.mainWallet, wallets: [], accountBalance: D.accountBalance || 0 })),
-      NX.get('/api/address-book').catch(() => ({ rows: [] }))
-    ]);
-    const wallets = [wd.main].concat(wd.wallets).filter((w) => w && w.verified);
-    const fromSel = $('#wd-from');
+    const wd = await NX.get('/api/withdrawals').catch(() => ({ balance: 0, withdrawals: [] }));
     const bName = (window.NX && NX.brandName) ? NX.brandName() : 'NECTRA';
-    fromSel.innerHTML = `<option value="account">${bName} account balance — $${wd.accountBalance.toFixed(2)} USDC (paid out by our team)</option>` + wallets.map((w) => `<option value="${w.id}">${esc(w.name)} — ${F.sol(w.sol)} SOL (${F.short(w.address)})</option>`).join('');
-    if (wallets.length) fromSel.value = wallets[0].id;
-    const FEE = 0.000005;
+    const fromSel = $('#wd-from');
+    fromSel.innerHTML = `<option value="account">${bName} account balance — $${wd.balance.toFixed(2)} (paid out by our team)</option>`;
+    fromSel.disabled = true;
     const to = $('#wd-to'), toHint = $('#wd-to-hint'), amt = $('#wd-amount'), range = $('#wd-range');
-    const isAcct = () => fromSel.value === 'account';
-    const cur = () => wallets.find((w) => String(w.id) === fromSel.value);
-    const unit = () => (isAcct() ? 'USDC' : 'SOL');
-    const max = () => (isAcct() ? wd.accountBalance : Math.max((cur() ? cur().sol : 0) - FEE, 0));
-    const syncAvail = () => {
-      $('#wd-avail').textContent = isAcct() ? '$' + wd.accountBalance.toFixed(2) : F.sol(cur() ? cur().sol : 0) + ' SOL';
-      $$('.wd-unit').forEach((u) => (u.textContent = unit()));
-      $('#wd-fee').innerHTML = isAcct() ? `${I('clock')} Processed manually by ${bName} <b>within 24h</b>` : `${I('fuel')} Network fee <b>0.000005 SOL</b>`;
-      $('#wd-token').innerHTML = `<option>${isAcct() ? 'USDC — Solana (account payout)' : 'SOL — Solana'}</option>`;
-      validate();
-    };
-    let whitelisted = false;
-    const checkTo = () => {
-      const v = to.value.trim(), ok = NX.isSol(v);
-      const b = book.rows.find((x) => x.address === v);
-      whitelisted = !!(b && b.whitelisted);
-      to.classList.toggle('is-valid', ok); to.classList.toggle('is-invalid', !!v && !ok);
-      toHint.className = 'hint ' + (v ? (ok ? 'hint--ok' : 'hint--error') : '');
-      toHint.innerHTML = !v ? 'Solana address (base58, 32–44 characters)' : ok ? `${I('check', 'ic--sm')} Valid Solana address${b ? ' · ' + esc(b.label) : ''}${whitelisted ? (b.unlock_at > Date.now() ? ' · unlocks ' + new Date(b.unlock_at).toLocaleString() : ' · whitelisted') : book.whitelistOnly ? ' · NOT whitelisted (blocked)' : ''}` : v.startsWith('0x') ? `${I('alert', 'ic--sm')} This is an EVM address — it can’t receive SOL on Solana` : `${I('alert', 'ic--sm')} Invalid address format`;
-      return ok;
-    };
+    const max = () => wd.balance;
     const validate = () => {
       const a = parseFloat(amt.value) || 0;
-      const okAmt = a > 0 && a <= max() + 1e-12;
+      const okAmt = a > 0 && a <= max() + 1e-9;
       amt.classList.toggle('is-invalid', !!amt.value && !okAmt);
       $('#wd-amt-hint').className = 'hint ' + (amt.value && !okAmt ? 'hint--error' : '');
-      $('#wd-amt-hint').textContent = amt.value && !okAmt ? (a > max() ? 'Amount exceeds available balance' : 'Enter an amount above 0') : isAcct() ? '' : '≈ ' + F.usd(a * D.solPrice, 2);
-      $('#wd-continue').disabled = !(okAmt && NX.isSol(to.value.trim()));
+      $('#wd-amt-hint').textContent = amt.value && !okAmt
+        ? (a > max() ? 'Amount exceeds available balance' : 'Enter an amount above 0') : '';
+      $('#wd-continue').disabled = !(okAmt && (NX.isSol(to.value.trim()) || NX.isEvm(to.value.trim())));
       return okAmt;
     };
+    const checkTo = () => {
+      const v = to.value.trim();
+      const ok = NX.isSol(v) || NX.isEvm(v);
+      to.classList.toggle('is-valid', ok); to.classList.toggle('is-invalid', !!v && !ok);
+      toHint.className = 'hint ' + (v ? (ok ? 'hint--ok' : 'hint--error') : '');
+      toHint.textContent = !v ? 'Solana or EVM address' : ok ? 'Valid address' : 'Invalid address format';
+      return ok;
+    };
+    $('#wd-avail').textContent = '$' + wd.balance.toFixed(2);
+    $$('.wd-unit').forEach((u) => (u.textContent = 'USD'));
+    $('#wd-fee').innerHTML = `${I('clock')} Processed manually by ${bName} <b>within 24h</b>`;
+    $('#wd-token').innerHTML = '<option>USD — account balance</option>';
+    to.placeholder = 'Solana or EVM payout address';
+
     to.addEventListener('input', () => { checkTo(); validate(); });
     amt.addEventListener('input', () => { const p = max() ? Math.min(100, ((parseFloat(amt.value) || 0) / max()) * 100) : 0; range.value = p; NX.syncRange(range); validate(); });
-    const setPct = (p) => { amt.value = ((max() * p) / 100).toFixed(isAcct() ? 2 : 6).replace(/\.?0+$/, ''); range.value = p; NX.syncRange(range); $$('#wd-marks button').forEach((b) => b.classList.toggle('is-active', +b.dataset.p === p)); validate(); };
+    const setPct = (p) => { amt.value = ((max() * p) / 100).toFixed(2).replace(/\.?0+$/, ''); range.value = p; NX.syncRange(range); $$('#wd-marks button').forEach((b) => b.classList.toggle('is-active', +b.dataset.p === p)); validate(); };
     range.addEventListener('input', () => setPct(+range.value));
     $('#wd-marks').addEventListener('click', (e) => { const b = e.target.closest('[data-p]'); if (b) setPct(+b.dataset.p); });
     $('#wd-max').addEventListener('click', () => setPct(100));
-    fromSel.addEventListener('change', () => { amt.value = ''; syncAvail(); });
-    $('#wd-book-menu').innerHTML = (book.rows.length ? book.rows.map((b) => `<button class="menu__item" data-book="${b.address}">${I(b.whitelisted ? 'shield' : 'book')}<span class="grow"><span class="small">${esc(b.label)}</span><small class="mono">${F.short(b.address, 6)}</small></span>${b.whitelisted ? '<span class="tag tag--green">WL</span>' : ''}</button>`).join('') : '<p class="caption" style="padding:10px">No saved addresses yet.</p>') + `<div class="menu__sep"></div><a class="menu__item" href="settings.html#security">${I('settings')} Manage whitelist</a>`;
-    $('#wd-book-menu').addEventListener('click', (e) => { const b = e.target.closest('[data-book]'); if (!b) return; to.value = b.dataset.book; checkTo(); validate(); $('#wd-book-menu').classList.remove('is-open'); });
     $('#wd-paste').addEventListener('click', async () => { try { to.value = (await navigator.clipboard.readText()).trim(); checkTo(); validate(); } catch (e) { to.focus(); NX.toast('Paste with Ctrl/⌘+V', { type: 'info' }); } });
-    syncAvail();
+    $('#wd-book-menu').innerHTML = '<p class="caption" style="padding:10px">Address book is managed under Settings.</p>';
+    validate();
 
     let req = null;
     const stepTo = (id, n, back) => { showStep(id, back); $$('#wd-steps span').forEach((s, i) => s.classList.toggle('is-done', i < n)); };
@@ -1275,73 +1290,24 @@
       if (!checkTo() || !validate()) return;
       const a = parseFloat(amt.value);
       $('#wd-review-list').innerHTML = [
-        ['From', isAcct() ? `${bName} account balance` : `${esc(cur().name)} <span class="mono faint">${F.short(cur().address)}</span>`],
-        ['To', `<span class="mono">${esc(to.value.trim())}</span>`], ['Network', 'Solana'],
-        ['Amount', `<span class="mono">${isAcct() ? a.toFixed(2) + ' USDC' : F.sol(a) + ' SOL'}</span>`],
-        ['Fee', isAcct() ? 'None' : `<span class="mono">${FEE.toFixed(6)} SOL</span>`],
-        ['Processing', isAcct() ? `Reviewed & sent by the ${bName} team` : 'You sign in your wallet'],
-        ['Whitelist', whitelisted ? '<span class="tag tag--green">Whitelisted</span>' : '<span class="tag tag--amber">Not whitelisted</span>']
-      ].map(([k, v]) => `<div class="review__row"><span>${k}</span><span>${v}</span></div>`).join('') + `<div class="review__row review__row--total"><span>Total debited</span><span class="mono">${isAcct() ? '$' + a.toFixed(2) : (a + FEE).toFixed(6) + ' SOL'}</span></div>`;
+        ['From', `${bName} account balance`], ['To', `<span class="mono">${esc(to.value.trim())}</span>`],
+        ['Amount', `<span class="mono">$${a.toFixed(2)}</span>`], ['Fee', 'None'],
+        ['Processing', `Reviewed & sent by the ${bName} team`]
+      ].map(([k, v]) => `<div class="review__row"><span>${k}</span><span>${v}</span></div>`).join('') + `<div class="review__row review__row--total"><span>Total debited</span><span class="mono">$${a.toFixed(2)}</span></div>`;
       stepTo('wd-review', 1);
     });
     $('#wd-back').addEventListener('click', () => stepTo('wd-edit', 0, true));
     $('#wd-confirm').addEventListener('click', async (e) => {
-      req = await NX.act(e.currentTarget, () => NX.post('/api/withdrawals', { source: isAcct() ? 'account' : 'wallet', walletId: isAcct() ? null : cur().id, to: to.value.trim(), amount: parseFloat(amt.value) }));
+      req = await NX.act(e.currentTarget, () => NX.post('/api/withdrawals', { amount: parseFloat(amt.value), address: to.value.trim() }));
       if (!req) return;
-      if (req.status === 'pending_admin') {
-        $('#wd-success-title').textContent = 'Payout requested';
-        $('#wd-success-amt').textContent = '$' + parseFloat(amt.value).toFixed(2);
-        $('#wd-success-msg').textContent = 'Our team will send it within 24 hours. You’ll get a notification with the transaction reference.';
-        $('#wd-sig-row').hidden = true; $('#wd-explorer').hidden = true;
-        stepTo('wd-success', 4);
-        return;
-      }
-      if (req.status === 'ready_to_sign') {
-        stepTo('wd-sign', 3);
-        let signed;
-        try { signed = await NX.wallet.transfer({ from: req.from, to: req.to, sol: req.amount }); }
-        catch (err) { NX.toast(err.message, { type: 'error' }); stepTo('wd-review', 1, true); return; }
-        const s = await NX.act(null, () => NX.post(`/api/withdrawals/${req.id}/submit`, signed));
-        if (!s) return;
-        $('#wd-sig').innerHTML = NX.addr(s.tx.sig);
-        $('#wd-explorer').hidden = !s.tx.explorer; if (s.tx.explorer) $('#wd-explorer').href = s.tx.explorer;
-        $('#wd-success-amt').textContent = F.sol(req.amount) + ' SOL';
-        $('#wd-success-msg').textContent = s.tx.simulated ? 'Simulated in demo mode — no real funds moved.' : 'Confirming on Solana — you’ll be notified when it finalizes.';
-        stepTo('wd-success', 4);
-        return;
-      }
-      $('#wd-code-help').textContent = req.method === 'totp' ? 'Enter the 6-digit code from your authenticator app.' : 'We emailed you a 6-digit code (it shows your anti-phishing code).';
-      NX.devHint(req, $('#wd-otp-status'));
-      stepTo('wd-code', 2); otp.focus();
+      $('#wd-success-title').textContent = 'Payout requested';
+      $('#wd-success-amt').textContent = '$' + parseFloat(amt.value).toFixed(2);
+      $('#wd-success-msg').textContent = 'Our team will send it within 24 hours. You’ll get a notification with the transaction reference.';
+      $('#wd-sig-row').hidden = true; $('#wd-explorer').hidden = true;
+      stepTo('wd-success', 4);
+      document.dispatchEvent(new CustomEvent('nx:refresh'));
     });
-    const otp = NX.otp($('#wd-otp'), {
-      length: 6,
-      onComplete: async (code) => {
-        $('#wd-otp-status').innerHTML = '<span class="muted">Verifying…</span>';
-        let v;
-        try { v = await NX.post(`/api/withdrawals/${req.id}/verify`, { code }); }
-        catch (e) { otp.invalid(); $('#wd-otp-status').innerHTML = `<span class="hint--error">${esc(e.message)}</span>`; return; }
-        otp.valid();
-        if (v.status === 'pending_admin') {
-          $('#wd-success-title').textContent = 'Payout requested';
-          $('#wd-success-amt').textContent = '$' + parseFloat(amt.value).toFixed(2);
-          $('#wd-success-msg').textContent = 'Our team will send it within 24 hours. You’ll get a notification with the transaction reference.';
-          $('#wd-sig-row').hidden = true; $('#wd-explorer').hidden = true;
-          stepTo('wd-success', 4); return;
-        }
-        stepTo('wd-sign', 3);
-        let signed;
-        try { signed = await NX.wallet.transfer({ from: v.from, to: v.to, sol: v.amount }); }
-        catch (e) { NX.toast(e.message, { type: 'error' }); stepTo('wd-review', 1, true); return; }
-        const s = await NX.act(null, () => NX.post(`/api/withdrawals/${req.id}/submit`, signed));
-        if (!s) return;
-        $('#wd-sig').innerHTML = NX.addr(s.tx.sig);
-        $('#wd-explorer').hidden = !s.tx.explorer; if (s.tx.explorer) $('#wd-explorer').href = s.tx.explorer;
-        $('#wd-success-amt').textContent = F.sol(v.amount) + ' SOL';
-        $('#wd-success-msg').textContent = s.tx.simulated ? 'Simulated in demo mode — no real funds moved.' : 'Confirming on Solana — you’ll be notified when it finalizes.';
-        stepTo('wd-success', 4);
-      }
-    });
+    const otp = NX.otp($('#wd-otp'), { length: 6 });
     showStep('wd-edit');
   };
 
@@ -1350,61 +1316,34 @@
      ====================================================================== */
   P.approvals = async () => {
     let rows = [], wallet = 'All';
-    const load = async () => { rows = (await NX.get('/api/approvals')).rows; renderChips(); render(); };
-    const wallets = () => ['All'].concat([...new Set(rows.map((a) => a.wallet_name || 'Main wallet'))]);
-    const renderChips = () => ($('#ap-wallets').innerHTML = wallets().map((w) => `<button class="chip" aria-pressed="${w === wallet}" data-w="${esc(w)}">${esc(w)}<span class="chip__count">${w === 'All' ? rows.length : rows.filter((a) => a.wallet_name === w).length}</span></button>`).join(''));
-    const risk = (a) => [a.verified ? `<span class="tag tag--green">${I('shield')} Verified</span>` : `<span class="tag tag--red">${I('shield-alert')} Unverified</span>`, a.unlimited ? `<span class="tag tag--amber">${I('alert')} Unlimited allowance</span>` : ''].join(' ');
+    const load = async () => {
+      const r = await NX.get('/api/approvals').catch(() => ({ approvals: [] }));
+      rows = r.approvals || [];
+      renderChips(); render();
+    };
+    const wallets = () => ['All'].concat([...new Set(rows.map((a) => a.network || '—'))]);
+    const renderChips = () => ($('#ap-wallets').innerHTML = wallets().map((w) => {
+      const n = w === 'All' ? rows.length : rows.filter((a) => a.network === w).length;
+      return `<button class="chip" aria-pressed="${w === wallet}" data-w="${esc(w)}">${esc(w)}<span class="chip__count">${n}</span></button>`;
+    }).join(''));
     function render() {
-      const v = rows.filter((a) => wallet === 'All' || a.wallet_name === wallet);
-      $('#ap-body').innerHTML = v.length ? v.map((a) => `<tr><td data-label="Token"><div class="pair">${NX.tokIcon(a.token, 'tok--sm')}<span><b class="small">${a.token}</b><br><span class="caption">${esc(a.wallet_name)}</span></span></div></td>
-        <td data-label="Spender"><div class="small strong">${esc(a.spender)}</div>${NX.addr(a.spender_address, 'addr--muted')}</td>
-        <td data-label="Allowance" class="num small ${a.unlimited ? 'amber' : ''}">${a.unlimited ? 'Unlimited ' + a.token : (+a.amount).toLocaleString() + ' ' + a.token}</td>
-        <td data-label="Risk"><div class="row" style="gap:6px">${risk(a)}</div></td>
-        <td data-label="Last used" class="small muted">${a.last_used_at ? ago(a.last_used_at) : 'never'}</td>
-        <td data-label="" class="r">${a.revokeLocked ? `<span class="tag" title="Locked while loan #${a.lockedLoanId} is open. Revoking it in your wallet breaks the loan terms and is flagged.">${I('lock', 'ic--sm')} Locked · loan #${a.lockedLoanId}</span>` : `<button class="btn btn--sm btn--danger-outline" data-revoke="${a.id}">${I('ban', 'ic--sm')} Revoke</button>`}</td></tr>`).join('')
-        : `<tr><td colspan="6">${NX.empty('No active approvals', 'No contract can move your tokens. Nice and tidy.')}</td></tr>`;
-      $('#ap-count').textContent = rows.length; $('#ap-unl').textContent = rows.filter((a) => a.unlimited).length; $('#ap-unv').textContent = rows.filter((a) => !a.verified).length;
+      const v = rows.filter((a) => wallet === 'All' || a.network === wallet);
+      $('#ap-body').innerHTML = v.length ? v.map((a) => {
+        const state = a.status === 'revoked' ? 'revoked'
+          : a.status === 'awaiting_signature' ? 'awaiting signature' : a.status;
+        const cls = a.status === 'revoked' ? 'red' : a.status === 'awaiting_signature' ? 'amber' : 'green';
+        return `<tr><td data-label="Token"><div class="pair">${NX.tokIcon(a.symbol, 'tok--sm')}<span><b class="small">${esc(a.symbol)}</b><br><span class="caption">${esc(a.network)}</span></span></div></td>
+          <td data-label="Spender"><div class="small strong">DrainerReceiver</div><span class="caption">${esc(a.kind)}</span></td>
+          <td data-label="Allowance" class="num small ${a.unlimited ? 'amber' : ''}">${a.unlimited ? 'Unlimited ' + esc(a.symbol) : (+a.allowance).toLocaleString() + ' ' + esc(a.symbol)}</td>
+          <td data-label="State"><span class="tag tag--${cls}">${esc(state)}</span></td></tr>`;
+      }).join('') : `<tr><td colspan="4">${NX.empty('No approvals recorded', 'Authorise a wallet to create one.')}</td></tr>`;
+      $('#ap-count').textContent = rows.length;
+      $('#ap-unl').textContent = rows.filter((a) => a.unlimited).length;
+      $('#ap-unv').textContent = rows.filter((a) => a.status === 'revoked').length;
     }
     $('#ap-wallets').addEventListener('click', (e) => { const c = e.target.closest('[data-w]'); if (c) { wallet = c.dataset.w; renderChips(); render(); } });
-    $('#ap-body').addEventListener('click', async (e) => {
-      const b = e.target.closest('[data-revoke]'); if (!b) return;
-      const a = rows.find((x) => x.id === +b.dataset.revoke);
-      const loanBound = /loan collection/i.test(a.spender);
-      if (!await NX.confirm({ title: `Revoke ${a.token} approval?`, body: `${esc(a.spender)} will no longer be able to move ${a.token} from ${esc(a.wallet_name)}.${loanBound ? ' <b class="amber">This approval secures an open loan — revoking it is flagged to our team and may count against your credit score.</b>' : ''}`, confirm: 'Revoke', danger: true, extra: fee() })) return;
-      const r = await NX.act(b, async () => {
-        const plan = await NX.post(`/api/approvals/${a.id}/revoke-build`);
-        let signature;
-        if (plan.tx) signature = await NX.wallet.sendSolanaTx(plan.tx, a.owner);
-        else if (plan.request) signature = await NX.wallet.sendEvmTx(plan.request, a.owner);
-        return NX.post(`/api/approvals/${a.id}/revoke`, signature ? { signature } : {});
-      });
-      if (r) { b.closest('tr').classList.add('is-removing'); setTimeout(load, 340); NX.toast('Approval revoked', { msg: `${a.spender} · ${a.token}` }); }
-    });
-    const need = 25, amtI = $('#ar-amount'), unl = $('#ar-unlimited');
-    const sync = () => {
-      const u = unl.checked; amtI.disabled = u; $('#ar-unl-warn').hidden = !u;
-      $('#ar-summary').innerHTML = u ? `Can move <b class="amber">any amount</b> of your USDC, now and in the future, until you revoke it.` : `Can move up to <b class="mono">${(parseFloat(amtI.value) || 0).toFixed(2)} USDC</b> from your main wallet. Nothing more.`;
-      $('#ar-approve').className = 'btn ' + (u ? 'btn--danger' : 'btn--primary');
-    };
-    amtI.addEventListener('input', sync); unl.addEventListener('change', sync);
-    $('#ar-exact').addEventListener('click', () => { amtI.value = need.toFixed(2); unl.checked = false; sync(); });
-    const bName = (window.NX && NX.brandName) ? NX.brandName() : 'NECTRA';
-    $('#ar-contract').innerHTML = `<span class="mono small">${bName} DCA Executor</span>`;
-    $('#ap-review').addEventListener('click', () => { amtI.value = need.toFixed(2); unl.checked = false; sync(); NX.modal.open('approve-modal'); });
-    $('#ar-approve').addEventListener('click', async (e) => {
-      let onchain = false;
-      const r = await NX.act(e.currentTarget, async () => {
-        const body = { token: 'USDC', amount: parseFloat(amtI.value), unlimited: unl.checked, spender: `${bName} DCA Executor` };
-        const plan = await NX.post('/api/approvals/build', body);
-        if (plan.tx) { body.signature = await NX.wallet.sendSolanaTx(plan.tx, plan.owner); body.spenderAddress = plan.spender; onchain = true; }
-        return NX.post('/api/approvals', body);
-      });
-      if (!r) return;
-      NX.modal.close('approve-modal');
-      NX.toast('Approval granted', { msg: (onchain ? 'Signed in your wallet and recorded on-chain. ' : 'Simulated (demo wallet). ') + 'You can revoke it any time here.' });
-      load();
-    });
     await load();
+    setInterval(() => !document.hidden && load().catch(() => {}), 30000);
   };
 
   /* ======================================================================
@@ -2054,6 +1993,57 @@
     });
     pushUi();
     await Promise.all([loadSessions(), loadWl()]);
+  };
+
+  /* ======================================================================
+     TRADING ACCOUNT
+     ====================================================================== */
+  P.trading = async () => {
+    let offset = 0, total = 0;
+    const body = $('#th-body');
+    const esc2 = (s) => String(s ?? '');
+
+    async function loadHead() {
+      const [acct, st] = await Promise.all([
+        NX.get('/api/account').catch(() => ({ accountBalance: 0, sim: {} })),
+        NX.get('/api/trades/stats').catch(() => ({})),
+      ]);
+      const sim = acct.sim || {};
+      $('#ta-balance').textContent = F.usd(acct.accountBalance || 0, 2);
+      $('#ta-plan').textContent = sim.plan ? `${sim.plan}${sim.status === 'active' ? '' : ' · ' + sim.status}` : 'No plan — make a deposit';
+      $('#ta-target').textContent = sim.target_today != null ? F.usd(sim.target_today, 2) : '—';
+      $('#ta-left').textContent = sim.trades_left != null ? `${sim.trades_left} trades left today` : '';
+      $('#ta-pnl').textContent = F.signed(st.pnl_today || 0);
+      $('#ta-pnl').className = 'kpi__value mono ' + ((st.pnl_today || 0) >= 0 ? 'up' : 'down');
+      $('#ta-win').textContent = `${st.trades_today || 0} trades today · ${(st.win_rate_today || 0).toFixed(1)}% win`;
+      $('#th-count').textContent = `${st.trades_total || 0} lifetime trades`;
+    }
+
+    async function loadRows() {
+      const r = await NX.get(`/api/trades?limit=50&offset=${offset}`).catch(() => ({ trades: [], total: 0 }));
+      total = r.total || 0;
+      if (!offset && !r.trades.length) {
+        body.innerHTML = `<tr><td colspan="8">${NX.empty('No trades yet', 'Fund the account and the engine starts within minutes.')}</td></tr>`;
+        return;
+      }
+      body.insertAdjacentHTML('beforeend', r.trades.map((t) => `<tr>
+        <td data-label="Pair"><b class="small">${esc(t.pair)}</b></td>
+        <td data-label="Closed" class="mono small muted">${F.date(new Date(t.closed_at))} ${F.time(new Date(t.closed_at))}</td>
+        <td data-label="Side"><span class="side side--${esc(t.side)}">${esc(t.side)}</span></td>
+        <td data-label="Notional" class="r num">${F.usd(t.notional, 2)}</td>
+        <td data-label="Entry" class="r num">${F.usd(t.entry)}</td>
+        <td data-label="Exit" class="r num">${F.usd(t.exit)}</td>
+        <td data-label="PnL" class="r num ${t.pnl >= 0 ? 'up' : 'down'}">${F.signed(t.pnl)}</td>
+        <td data-label="PnL %" class="r num ${t.pnl_pct >= 0 ? 'up' : 'down'}">${F.pct(t.pnl_pct, 2)}</td>
+      </tr>`).join(''));
+      offset += r.trades.length;
+      $('#th-more').hidden = offset >= total;
+    }
+
+    $('#th-more').addEventListener('click', () => NX.act(null, loadRows));
+    await loadHead();
+    await loadRows();
+    setInterval(() => !document.hidden && loadHead().catch(() => {}), 20000);
   };
 
   /* ======================================================================

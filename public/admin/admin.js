@@ -29,6 +29,8 @@
     { id: 'invites', label: 'Invites', icon: 'gift' },
     { id: 'waitlist', label: 'Waitlist', icon: 'clock', badge: 'waitlist' },
     { g: 'Trading' },
+    { id: 'desk-deposits', label: 'Deposits', icon: 'deposit', href: '/admin/desk.html' },
+    { id: 'desk-payouts', label: 'Desk & payouts', icon: 'grid', href: '/admin/desk.html' },
     { id: 'bots', label: 'Bots', icon: 'bot' },
     { id: 'transactions', label: 'Transactions', icon: 'swap' },
     { id: 'plans', label: 'Plans & subscriptions', icon: 'sparkles' },

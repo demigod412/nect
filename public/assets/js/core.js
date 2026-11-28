@@ -571,6 +571,7 @@
     { g: 'Trade' },
     { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
     { id: 'bot', label: 'AI Bots', icon: 'bot' },
+    { id: 'trading', label: 'Trading', icon: 'trending-up' },
     { id: 'portfolio', label: 'Portfolio', icon: 'pie' },
     { g: 'Funds' },
     { id: 'wallets', label: 'Wallets', icon: 'wallet' },
